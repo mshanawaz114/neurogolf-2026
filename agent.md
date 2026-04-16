@@ -4,7 +4,7 @@
 > **Host:** Kaggle · IJCAI-ECAI 2026 Competitions Track
 > **URL:** https://www.kaggle.com/competitions/neurogolf-2026
 > **Repo:** https://github.com/mshanawaz114/neurogolf-2026
-> **Last updated:** April 15, 2026
+> **Last updated:** April 16, 2026
 
 ---
 
@@ -153,15 +153,48 @@ Handles identity, flip_h, flip_v, rotate_90/180/270, transpose.
 Uses ONNX `Slice` + `Pad` + `Transpose` — **zero MACs, near-zero params**.
 Score per task: ~**21+**
 
+### Priority 8 — `TilingSolver`
+Handles direct input tiling such as `tile(input, n x m)`.
+Uses repeated `Concat` + `Pad` — **zero MACs**.
+Score per task: ~**21+**
+
 ### Priority 10 — `ColorPermSolver`
 Handles pure colour-permutation tasks (positions unchanged, colours remapped).
 Uses a 1×1 conv with a 10×10 permutation weight matrix.
 Score per task: ~**13.6**
 
+### Priority 12 — `TranslateSolver`
+Handles zero-filled translations on same-sized grids.
+Uses `Slice` + `Pad` analytically — **zero MACs**.
+Score per task: ~**21+**
+
+### Priority 13 — `UpscaleSolver`
+Handles integer nearest-neighbour upscaling such as 2x2 or 3x3 expansion.
+Uses ONNX `Resize` plus fixed crop/pad.
+Score per task: ~**20+**
+
+### Priority 14 — `TrimBBoxSolver`
+Handles tasks where the output is the bounding-box crop of all non-background pixels.
+Uses multi-candidate analytical crop selection across observed splits.
+Score per task: usually **18–20+** depending on selector graph size.
+
 ### Priority 90 — `LearnedSolver`
-Fallback: trains a tiny PyTorch net (multiple architectures tried smallest-first),
-then exports to ONNX. Used only when no analytical solver applies.
-Score per task: ~**9–13** depending on architecture needed.
+Fallback: trains a PyTorch or NumPy conv net over a staged architecture search.
+Now includes larger late-stage receptive fields and restart seeds so some harder tasks
+have a better chance to convert from `0` into a real submission.
+Score per task: ~**8–13** depending on architecture needed.
+
+### Current Exact Validated Tasks
+
+The current deterministic stack validates exactly on:
+
+`task031`, `task053`, `task087`, `task140`, `task150`, `task155`,
+`task179`, `task223`, `task241`, `task276`, `task307`, `task309`
+
+Current exact solved count: **12**
+
+This is still far from leaderboard-contending coverage, but it is the current
+stable analytical base.
 
 ---
 
@@ -184,7 +217,11 @@ neurogolf-2026/
 │   ├── base.py               ← abstract BaseSolver
 │   ├── spatial.py            ← SpatialSolver (flip/rotate/transpose)
 │   ├── color_perm.py         ← ColorPermSolver (1×1 conv)
-│   ├── identity.py           ← IdentitySolver
+│   ├── tiling.py             ← TilingSolver
+│   ├── translate.py          ← TranslateSolver
+│   ├── upscale.py            ← UpscaleSolver
+│   ├── trim_bbox.py          ← TrimBBoxSolver
+│   ├── gravity.py            ← GravitySolver stub
 │   └── learned.py            ← LearnedSolver (PyTorch training fallback)
 │
 ├── utils/
@@ -210,12 +247,32 @@ neurogolf-2026/
 ## Agent Instructions: How to Solve a New Task
 
 1. **Load and inspect** — `python3 utils/visualize.py --task tasks/taskNNN.json`
-2. **Run analysis** — check what `analyse_task()` returns (colour perm? flip? rotate?)
+2. **Run analysis** — check what `analyse_task()` returns
+   Look first for: spatial, tiling, translation, upscale, trim-bbox, colour remap
 3. **Run auto-solver first** — `python3 scripts/solve_all.py --task taskNNN`
 4. **If auto-solver fails**, inspect the task manually and write a custom solver in `solutions/taskNNN.py`
 5. **Validate** — `make validate TASK=NNN`
 6. **Score** — `make score TASK=NNN`
 7. **Submit** — `make zip` then upload `submission.zip` to Kaggle (max 5/day)
+
+### Git Workflow For Fast Detection
+
+Use git as a quick scoreboard for the codebase itself:
+
+```bash
+git status --short
+git diff
+git diff -- solvers/learned.py
+git diff -- utils/arc_utils.py
+```
+
+Recommended habit during solver work:
+
+1. Run `git status --short` before changing anything
+2. After each solver experiment, inspect `git diff -- <file>`
+3. Keep a mental note of whether a change improved:
+   exact validated task count, learned solve rate, or model cost
+4. If a run created `results.csv`, read the top lines immediately to confirm whether the change actually moved solved coverage
 
 ### Design principles for manual solutions
 
@@ -224,8 +281,18 @@ neurogolf-2026/
 - Prefer `Conv1×1` over `Conv3×3` when only colour matters
 - The weight matrix in a 1×1 conv is a **10×10 linear map** — many colour tasks reduce to this
 - For tasks where the output grid is smaller than the input: crop with `Slice`, then re-pad
+- Be suspicious of train-only detections. If `arc-gen` changes sizes, the ONNX often needs runtime shape-selection branches.
 - Avoid the banned ops: `Loop`, `Scan`, `NonZero`, `Unique`, `Script`, `Function`
 - Test against ALL splits (train + test + arc-gen) before submitting
+
+### Current Climb Strategy
+
+To move toward the top of the leaderboard, the repo should optimize in this order:
+
+1. Add reusable exact solvers for structural families with real yield
+2. Harden existing analytical solvers against variable-size `test` and `arc-gen` splits
+3. Improve learned fallback only after the easy exact points are exhausted
+4. Prefer one change that adds several validated tasks over many changes that only shrink a model already solving the same task
 
 ---
 

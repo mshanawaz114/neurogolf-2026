@@ -68,6 +68,24 @@ make zip
 # → submission.zip ready to upload to Kaggle
 ```
 
+### Fast Repo Check
+
+Use this before and after experiments so it is obvious what changed:
+
+```bash
+# See tracked edits + untracked solver files quickly
+git status --short
+
+# See the actual code diff for the current optimization pass
+git diff
+
+# Review just one file when a solver starts working or regresses
+git diff -- solvers/spatial.py
+
+# Inspect the latest solve summary if a run completed
+sed -n '1,40p' results.csv
+```
+
 ---
 
 ## Per-task Workflow
@@ -123,10 +141,44 @@ See [agent.md](agent.md) for the full technical specification.
 | Solver | Priority | Approach | Score/task |
 |---|---|---|---|
 | `SpatialSolver` | 5 | Slice + Pad + Transpose (zero MACs) | ~20+ |
-| `ColorPermSolver` | 10 | 1×1 Conv with 10×10 weight matrix | ~13.6 |
 | `TilingSolver` | 8 | Concat + Pad (zero MACs) | ~21+ |
+| `ColorPermSolver` | 10 | 1×1 Conv with 10×10 weight matrix | ~13.6 |
+| `TranslateSolver` | 12 | Slice + Pad translation (zero MACs) | ~21+ |
+| `UpscaleSolver` | 13 | Nearest-neighbour resize + crop | ~20+ |
+| `TrimBBoxSolver` | 14 | Crop to bounding box of non-background pixels | ~18-20 |
 | `GravitySolver` | 15 | Stub — falls through to LearnedSolver | — |
-| `LearnedSolver` | 90 | Adam-trained tiny conv net (PyTorch or NumPy) | ~9–13 |
+| `LearnedSolver` | 90 | Adam-trained conv search with larger late-stage models | ~8–13 |
+
+### Current Exact Coverage
+
+As of the current repo state, the deterministic stack validates exactly on:
+
+`task031`, `task053`, `task087`, `task140`, `task150`, `task155`,
+`task179`, `task223`, `task241`, `task276`, `task307`, `task309`
+
+That is `12` exact solves before counting any learned-fallback wins.
+
+### What To Detect First
+
+When inspecting a new task, check these in order:
+
+1. Same-shape pure spatial transform:
+   `flip`, `rotate`, `transpose`
+2. Pure colour remap:
+   positions unchanged, colours differ
+3. Size-changing but structural transform:
+   tiling, translation, integer upscale, bbox crop
+4. Variable-size spatial family:
+   if train works but `arc-gen` changes size, assume you need a multi-shape analytical ONNX
+5. Only after those fail, spend time on learned fallback or one-off task logic
+
+### Current Bottleneck
+
+The main limitation is no longer the obvious spatial/color tasks. The remaining climb is mostly:
+
+- higher-yield structural families not yet detected
+- stronger learned coverage on the large unsolved set
+- avoiding train-only detections that break on `test` or `arc-gen`
 
 ### Running with PyTorch (recommended, much faster)
 

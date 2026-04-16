@@ -63,21 +63,25 @@ class _TorchConvNet:
 
 
 def _train_torch(model, X, Y, max_epochs, lr, torch, optim, nn,
-                 stagnation_patience=150):
+                 stagnation_patience=80, deadline=None):
+    """Train with stagnation early-stop and optional wall-clock deadline."""
+    import time
     loss_fn   = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     sched     = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=80, factor=0.5, min_lr=1e-5)
+        optimizer, patience=50, factor=0.5, min_lr=1e-5)
     model.train()
     best_loss = float("inf")
     stall = 0
     for epoch in range(max_epochs):
+        if deadline is not None and time.time() > deadline:
+            return False   # time limit exceeded
         optimizer.zero_grad()
         out  = model(X)
         loss = loss_fn(out, Y)
         loss.backward()
         optimizer.step()
-        sched.step(loss)
+        sched.step(loss.detach())
         l = loss.item()
         if l < best_loss - 1e-4:
             best_loss = l
@@ -89,6 +93,12 @@ def _train_torch(model, X, Y, max_epochs, lr, torch, optim, nn,
         with torch.no_grad():
             if torch.equal(out.argmax(dim=1), Y):
                 return True
+        # Early accuracy check: if after 100 epochs accuracy is < 5%, give up
+        if epoch == 100:
+            with torch.no_grad():
+                acc = (out.argmax(dim=1) == Y).float().mean().item()
+            if acc < 0.05:
+                return False
     return False
 
 
@@ -293,23 +303,30 @@ def _cross_entropy(logits, targets):
 
 # ── Architecture search ────────────────────────────────────────────────────────
 
-ARCHS = [
-    (C,  1, 1),    # 1×1: colour map only (fastest)
-    (C,  3, 1),    # 3×3 single
-    (16, 3, 2),    # 2-layer 3×3
-    (C,  5, 1),    # 5×5 single
-    (32, 3, 2),    # wider 2-layer
-    (16, 5, 2),    # 2-layer 5×5
-    (C,  7, 1),    # 7×7 single
-    (16, 3, 3),    # 3-layer 3×3
-    (32, 3, 3),    # wider 3-layer
+ARCH_TRIALS = [
+    {"hidden": C,  "kernel": 1, "depth": 1, "restarts": 1, "stage1_epochs": 400, "stage2_epochs": 800},
+    {"hidden": C,  "kernel": 3, "depth": 1, "restarts": 2, "stage1_epochs": 400, "stage2_epochs": 800},
+    {"hidden": 16, "kernel": 3, "depth": 2, "restarts": 2, "stage1_epochs": 400, "stage2_epochs": 800},
+    {"hidden": C,  "kernel": 5, "depth": 1, "restarts": 1, "stage1_epochs": 400, "stage2_epochs": 800},
+    {"hidden": 32, "kernel": 3, "depth": 2, "restarts": 2, "stage1_epochs": 450, "stage2_epochs": 900},
+    {"hidden": 16, "kernel": 5, "depth": 2, "restarts": 1, "stage1_epochs": 450, "stage2_epochs": 900},
+    {"hidden": C,  "kernel": 7, "depth": 1, "restarts": 1, "stage1_epochs": 450, "stage2_epochs": 900},
+    {"hidden": 16, "kernel": 3, "depth": 3, "restarts": 1, "stage1_epochs": 500, "stage2_epochs": 1000},
+    {"hidden": 32, "kernel": 3, "depth": 3, "restarts": 1, "stage1_epochs": 500, "stage2_epochs": 1000},
+    {"hidden": 32, "kernel": 5, "depth": 2, "restarts": 1, "stage1_epochs": 550, "stage2_epochs": 1100},
+    {"hidden": 16, "kernel": 7, "depth": 2, "restarts": 1, "stage1_epochs": 550, "stage2_epochs": 1100},
+    {"hidden": 16, "kernel": 5, "depth": 3, "restarts": 1, "stage1_epochs": 600, "stage2_epochs": 1200},
+    {"hidden": 32, "kernel": 5, "depth": 3, "restarts": 1, "stage1_epochs": 650, "stage2_epochs": 1300},
+    {"hidden": 64, "kernel": 3, "depth": 3, "restarts": 1, "stage1_epochs": 650, "stage2_epochs": 1300},
+    {"hidden": C,  "kernel": 9, "depth": 1, "restarts": 1, "stage1_epochs": 550, "stage2_epochs": 1100},
 ]
 
 
 # ── Training ───────────────────────────────────────────────────────────────────
 
-def _train_numpy(model, X, Y, max_epochs=600, lr=3e-3, stagnation=120):
+def _train_numpy(model, X, Y, max_epochs=600, lr=3e-3, stagnation=120, deadline=None):
     """Train NumpyConvNet. Returns True when pixel-perfect."""
+    import time
     best_loss = np.inf
     stall = 0
     cur_lr = lr
@@ -317,7 +334,13 @@ def _train_numpy(model, X, Y, max_epochs=600, lr=3e-3, stagnation=120):
     lr_stall = 0
 
     for epoch in range(max_epochs):
+        if deadline is not None and time.time() > deadline:
+            return False
         logits = model.forward(X)
+        if epoch == 100:
+            acc = (np.argmax(logits, axis=1) == Y).mean()
+            if acc < 0.05:
+                return False
         loss, dlogits = _cross_entropy(logits, Y)
         grads = model.backward(dlogits)
         model.step_adam(grads, cur_lr)
@@ -377,6 +400,7 @@ class LearnedSolver(BaseSolver):
     # ── PyTorch path ────────────────────────────────────────────────────────
 
     def _build_torch(self, task_id, all_pairs, train_pairs, out_dir, torch, nn, optim):
+        import time
         X_tr = torch.from_numpy(make_batch_np(train_pairs)[0])
         Y_tr = torch.from_numpy(make_batch_np(train_pairs)[1])
         X_all_np, Y_all_np = make_batch_np(all_pairs)
@@ -384,56 +408,98 @@ class LearnedSolver(BaseSolver):
         Y_all = torch.from_numpy(Y_all_np)
         path = out_dir / f"{task_id}.onnx"
 
-        for hidden, kernel, depth in ARCHS:
-            label = f"h={hidden} k={kernel} d={depth}"
+        # Per-task deadline: 180 seconds total
+        task_deadline = time.time() + 180.0
 
-            # Stage 1: train-only
-            model = _TorchConvNet(hidden, kernel, depth, torch, nn)
-            if not _train_torch(model, X_tr, Y_tr, 600, 3e-3, torch, optim, nn):
-                continue
-            if _is_exact_torch(model, X_all, Y_all, torch):
-                if _export_torch(model, path, torch, onnx):
-                    print(f"      ✓ {label}  (stage-1 generalised)")
-                    return path
+        for trial in ARCH_TRIALS:
+            if time.time() > task_deadline:
+                break
+            hidden = trial["hidden"]
+            kernel = trial["kernel"]
+            depth = trial["depth"]
+            for seed in range(trial["restarts"]):
+                if time.time() > task_deadline:
+                    break
+                torch.manual_seed(seed)
+                label = f"h={hidden} k={kernel} d={depth} s={seed}"
 
-            # Stage 2: all-pairs
-            model2 = _TorchConvNet(hidden, kernel, depth, torch, nn)
-            if _train_torch(model2, X_all, Y_all, 1200, 1e-3, torch, optim, nn):
-                if _export_torch(model2, path, torch, onnx):
-                    print(f"      ✓ {label}  (stage-2 all-pairs)")
-                    return path
+                # Stage 1: train-only
+                model = _TorchConvNet(hidden, kernel, depth, torch, nn)
+                if not _train_torch(
+                    model, X_tr, Y_tr, trial["stage1_epochs"], 3e-3, torch, optim, nn,
+                    deadline=task_deadline
+                ):
+                    continue
+                if _is_exact_torch(model, X_all, Y_all, torch):
+                    if _export_torch(model, path, torch, onnx):
+                        print(f"      ✓ {label}  (stage-1 generalised)")
+                        return path
+
+                if time.time() > task_deadline:
+                    break
+
+                # Stage 2: all-pairs
+                torch.manual_seed(seed + 1000)
+                model2 = _TorchConvNet(hidden, kernel, depth, torch, nn)
+                if _train_torch(
+                    model2, X_all, Y_all, trial["stage2_epochs"], 1e-3, torch, optim, nn,
+                    deadline=task_deadline
+                ):
+                    if _export_torch(model2, path, torch, onnx):
+                        print(f"      ✓ {label}  (stage-2 all-pairs)")
+                        return path
         return None
 
     # ── NumPy path ──────────────────────────────────────────────────────────
 
     def _build_numpy(self, task_id, all_pairs, train_pairs, out_dir):
+        import time
         X_tr, Y_tr = make_batch_np(train_pairs)
         X_all, Y_all = make_batch_np(all_pairs)
         path = out_dir / f"{task_id}.onnx"
+        task_deadline = time.time() + 180.0
 
-        for hidden, kernel, depth in ARCHS:
+        for trial in ARCH_TRIALS:
+            if time.time() > task_deadline:
+                break
+            hidden = trial["hidden"]
+            kernel = trial["kernel"]
+            depth = trial["depth"]
             label = f"h={hidden} k={kernel} d={depth}"
 
-            # Stage 1: train-only (fast, few pairs)
-            model = NumpyConvNet(hidden, kernel, depth, seed=42)
-            if not _train_numpy(model, X_tr, Y_tr, max_epochs=600, lr=3e-3):
-                continue
-            if np.array_equal(model.predict(X_all), Y_all):
-                try:
-                    model.to_onnx(path)
-                    print(f"      ✓ {label}  (stage-1 generalised, numpy)")
-                    return path
-                except Exception as e:
-                    print(f"      export error: {e}")
+            for seed in range(trial["restarts"]):
+                if time.time() > task_deadline:
+                    break
 
-            # Stage 2: all-pairs (slower)
-            model2 = NumpyConvNet(hidden, kernel, depth, seed=42)
-            if _train_numpy(model2, X_all, Y_all, max_epochs=1200, lr=1e-3):
-                try:
-                    model2.to_onnx(path)
-                    print(f"      ✓ {label}  (stage-2 all-pairs, numpy)")
-                    return path
-                except Exception as e:
-                    print(f"      export error: {e}")
+                # Stage 1: train-only (fast, few pairs)
+                model = NumpyConvNet(hidden, kernel, depth, seed=42 + seed)
+                if not _train_numpy(
+                    model, X_tr, Y_tr, max_epochs=trial["stage1_epochs"],
+                    lr=3e-3, deadline=task_deadline
+                ):
+                    continue
+                if np.array_equal(model.predict(X_all), Y_all):
+                    try:
+                        model.to_onnx(path)
+                        print(f"      ✓ {label} s={seed}  (stage-1 generalised, numpy)")
+                        return path
+                    except Exception as e:
+                        print(f"      export error: {e}")
+
+                if time.time() > task_deadline:
+                    break
+
+                # Stage 2: all-pairs (slower)
+                model2 = NumpyConvNet(hidden, kernel, depth, seed=4200 + seed)
+                if _train_numpy(
+                    model2, X_all, Y_all, max_epochs=trial["stage2_epochs"],
+                    lr=1e-3, deadline=task_deadline
+                ):
+                    try:
+                        model2.to_onnx(path)
+                        print(f"      ✓ {label} s={seed}  (stage-2 all-pairs, numpy)")
+                        return path
+                    except Exception as e:
+                        print(f"      export error: {e}")
 
         return None

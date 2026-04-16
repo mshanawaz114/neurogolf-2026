@@ -34,6 +34,184 @@ INT_MAX =  2**31 - 1
 INT_MIN = -(2**31)
 
 
+def _slice_dim(inputs: list[str], output: str, axis: int, start: int, end: int, prefix: str):
+    inits = [
+        _make_int64(f"{prefix}_s", [start]),
+        _make_int64(f"{prefix}_e", [end]),
+        _make_int64(f"{prefix}_a", [axis]),
+        _make_int64(f"{prefix}_st", [1]),
+    ]
+    node = helper.make_node(
+        "Slice", inputs=inputs + [f"{prefix}_s", f"{prefix}_e", f"{prefix}_a", f"{prefix}_st"], outputs=[output]
+    )
+    return [node], inits
+
+
+def _flip_h_branch(prefix: str, grid_w: int):
+    nodes = []
+    inits = []
+    start = CANVAS - grid_w
+
+    n, i = _slice_dim(["input"], f"{prefix}_flipped", 3, INT_MAX, INT_MIN, f"{prefix}_flip")
+    nodes += n
+    inits += i
+    inits[-1] = _make_int64(f"{prefix}_flip_st", [-1])
+    nodes[-1] = helper.make_node(
+        "Slice",
+        inputs=["input", f"{prefix}_flip_s", f"{prefix}_flip_e", f"{prefix}_flip_a", f"{prefix}_flip_st"],
+        outputs=[f"{prefix}_flipped"],
+    )
+
+    n, i = _slice_dim([f"{prefix}_flipped"], f"{prefix}_sliced", 3, start, CANVAS, f"{prefix}_crop")
+    nodes += n
+    inits += i
+
+    inits.append(_make_int64(f"{prefix}_pad", [0, 0, 0, 0, 0, 0, 0, CANVAS - grid_w]))
+    nodes.append(
+        helper.make_node("Pad", inputs=[f"{prefix}_sliced", f"{prefix}_pad"], outputs=[f"{prefix}_out"], mode="constant")
+    )
+    return nodes, inits, f"{prefix}_out"
+
+
+def _flip_v_branch(prefix: str, grid_h: int):
+    nodes = []
+    inits = []
+    start = CANVAS - grid_h
+
+    n, i = _slice_dim(["input"], f"{prefix}_flipped", 2, INT_MAX, INT_MIN, f"{prefix}_flip")
+    nodes += n
+    inits += i
+    inits[-1] = _make_int64(f"{prefix}_flip_st", [-1])
+    nodes[-1] = helper.make_node(
+        "Slice",
+        inputs=["input", f"{prefix}_flip_s", f"{prefix}_flip_e", f"{prefix}_flip_a", f"{prefix}_flip_st"],
+        outputs=[f"{prefix}_flipped"],
+    )
+
+    n, i = _slice_dim([f"{prefix}_flipped"], f"{prefix}_sliced", 2, start, CANVAS, f"{prefix}_crop")
+    nodes += n
+    inits += i
+
+    inits.append(_make_int64(f"{prefix}_pad", [0, 0, 0, 0, 0, 0, CANVAS - grid_h, 0]))
+    nodes.append(
+        helper.make_node("Pad", inputs=[f"{prefix}_sliced", f"{prefix}_pad"], outputs=[f"{prefix}_out"], mode="constant")
+    )
+    return nodes, inits, f"{prefix}_out"
+
+
+def _transpose_branch(prefix: str, H: int, W: int):
+    nodes = []
+    inits = []
+    n, i = _slice_dim(["input"], f"{prefix}_rows", 2, 0, H, f"{prefix}_row_slice")
+    nodes += n
+    inits += i
+    n, i = _slice_dim([f"{prefix}_rows"], f"{prefix}_crop", 3, 0, W, f"{prefix}_col_slice")
+    nodes += n
+    inits += i
+    nodes.append(helper.make_node("Transpose", inputs=[f"{prefix}_crop"], outputs=[f"{prefix}_tr"], perm=[0, 1, 3, 2]))
+    inits.append(_make_int64(f"{prefix}_pad", [0, 0, 0, 0, 0, 0, CANVAS - W, CANVAS - H]))
+    nodes.append(
+        helper.make_node("Pad", inputs=[f"{prefix}_tr", f"{prefix}_pad"], outputs=[f"{prefix}_out"], mode="constant")
+    )
+    return nodes, inits, f"{prefix}_out"
+
+
+def _shape_selector(prefix: str, H: int, W: int):
+    nodes = []
+    inits = []
+
+    nodes.append(helper.make_node("ReduceMax", inputs=["input"], outputs=[f"{prefix}_cmax"], axes=[1], keepdims=0))
+    nodes.append(
+        helper.make_node("ReduceMax", inputs=[f"{prefix}_cmax"], outputs=[f"{prefix}_col_presence"], axes=[1], keepdims=0)
+    )
+    nodes.append(
+        helper.make_node("ReduceMax", inputs=[f"{prefix}_cmax"], outputs=[f"{prefix}_row_presence"], axes=[2], keepdims=0)
+    )
+
+    def pick(vec_name: str, axis: int, idx: int, name: str):
+        inits_local = [
+            _make_int64(f"{name}_s", [idx]),
+            _make_int64(f"{name}_e", [idx + 1]),
+            _make_int64(f"{name}_a", [axis]),
+            _make_int64(f"{name}_st", [1]),
+        ]
+        node = helper.make_node(
+            "Slice", inputs=[vec_name, f"{name}_s", f"{name}_e", f"{name}_a", f"{name}_st"], outputs=[f"{name}_out"]
+        )
+        return node, inits_local, f"{name}_out"
+
+    node, init, h_prev = pick(f"{prefix}_row_presence", 1, H - 1, f"{prefix}_hp")
+    nodes.append(node)
+    inits += init
+    node, init, w_prev = pick(f"{prefix}_col_presence", 1, W - 1, f"{prefix}_wp")
+    nodes.append(node)
+    inits += init
+
+    h_sel = h_prev
+    if H < CANVAS:
+        node, init, h_next = pick(f"{prefix}_row_presence", 1, H, f"{prefix}_hn")
+        nodes.append(node)
+        inits += init
+        inits.append(_t(f"{prefix}_one", np.array([1.0], dtype=np.float32)))
+        nodes.append(helper.make_node("Sub", inputs=[f"{prefix}_one", h_next], outputs=[f"{prefix}_hgap"]))
+        nodes.append(helper.make_node("Mul", inputs=[h_prev, f"{prefix}_hgap"], outputs=[f"{prefix}_hsel"]))
+        h_sel = f"{prefix}_hsel"
+
+    w_sel = w_prev
+    if W < CANVAS:
+        node, init, w_next = pick(f"{prefix}_col_presence", 1, W, f"{prefix}_wn")
+        nodes.append(node)
+        inits += init
+        if not any(t.name == f"{prefix}_one" for t in inits):
+            inits.append(_t(f"{prefix}_one", np.array([1.0], dtype=np.float32)))
+        nodes.append(helper.make_node("Sub", inputs=[f"{prefix}_one", w_next], outputs=[f"{prefix}_wgap"]))
+        nodes.append(helper.make_node("Mul", inputs=[w_prev, f"{prefix}_wgap"], outputs=[f"{prefix}_wsel"]))
+        w_sel = f"{prefix}_wsel"
+
+    nodes.append(helper.make_node("Mul", inputs=[h_sel, w_sel], outputs=[f"{prefix}_sel"]))
+    return nodes, inits, f"{prefix}_sel"
+
+
+def _multi_shape_spatial_net(transform: str, shapes: list[tuple[int, int]]) -> onnx.ModelProto:
+    branch_builder = {
+        "flip_h": lambda prefix, H, W: _flip_h_branch(prefix, W),
+        "flip_v": lambda prefix, H, W: _flip_v_branch(prefix, H),
+        "transpose": _transpose_branch,
+    }[transform]
+
+    nodes = []
+    inits = []
+    weighted = []
+    unique_shapes = sorted(set(shapes))
+
+    for idx, (H, W) in enumerate(unique_shapes):
+        prefix = f"m{idx}"
+        bn, bi, bout = branch_builder(prefix, H, W)
+        sn, si, sel = _shape_selector(prefix, H, W)
+        nodes += bn + sn
+        inits += bi + si
+        nodes.append(helper.make_node("Mul", inputs=[bout, sel], outputs=[f"{prefix}_weighted"]))
+        weighted.append(f"{prefix}_weighted")
+
+    current = weighted[0]
+    for idx, name in enumerate(weighted[1:], start=1):
+        out = "output" if idx == len(weighted) - 1 else f"m_add_{idx}"
+        nodes.append(helper.make_node("Add", inputs=[current, name], outputs=[out]))
+        current = out
+
+    graph = helper.make_graph(
+        nodes,
+        f"{transform}_multi",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, C, CANVAS, CANVAS])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, C, CANVAS, CANVAS])],
+        inits,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    return model
+
+
 def _rotate_90_net(H: int, W: int) -> onnx.ModelProto:
     """
     Rotate 90° CCW: [H,W] → [W,H].  Maps (h,w) → (W-1-w, h).
@@ -231,11 +409,25 @@ class SpatialSolver(BaseSolver):
                 return None
 
         # For size-dependent transforms, try each unique train input shape
-        in_shapes = analysis.get("input_shapes", [])
+        in_shapes = sorted(
+            {
+                (len(pair["input"]), len(pair["input"][0]))
+                for split in ["train", "test", "arc-gen"]
+                for pair in task.get(split, [])
+            }
+        )
         if not in_shapes:
             return None
 
         path = out_dir / f"{task_id}.onnx"
+        if t in {"flip_h", "flip_v", "transpose"} and len(in_shapes) > 1:
+            try:
+                model = _multi_shape_spatial_net(t, in_shapes)
+                save(model, str(path))
+                return path
+            except Exception as e:
+                print(f"    SpatialSolver({t}, multi-shape) failed: {e}")
+
         for shape in in_shapes:
             H, W = shape
             try:

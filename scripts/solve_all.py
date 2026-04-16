@@ -29,16 +29,24 @@ from utils.scoring     import analyse as score_onnx
 
 # Import all solvers
 from solvers.spatial    import SpatialSolver
+from solvers.spatial_color import SpatialColorSolver
 from solvers.color_perm import ColorPermSolver
 from solvers.tiling     import TilingSolver
+from solvers.translate  import TranslateSolver
+from solvers.trim_bbox  import TrimBBoxSolver
+from solvers.upscale    import UpscaleSolver
 from solvers.gravity    import GravitySolver
 from solvers.learned    import LearnedSolver
 
 
 ALL_SOLVERS = [
     SpatialSolver(),
+    SpatialColorSolver(),
     ColorPermSolver(),
     TilingSolver(),
+    TranslateSolver(),
+    TrimBBoxSolver(),
+    UpscaleSolver(),
     GravitySolver(),
     LearnedSolver(),
 ]

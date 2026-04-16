@@ -191,6 +191,82 @@ def detect_tiling(inp: np.ndarray, out: np.ndarray) -> tuple[int,int] | None:
     return None
 
 
+def detect_translation(inp: np.ndarray, out: np.ndarray) -> tuple[int, int] | None:
+    """Detect pure zero-filled translation on same-sized grids."""
+    if inp.shape != out.shape:
+        return None
+    H, W = inp.shape
+    for dy in range(-H + 1, H):
+        for dx in range(-W + 1, W):
+            shifted = np.zeros_like(inp)
+            y0 = max(0, dy)
+            y1 = min(H, H + dy)
+            x0 = max(0, dx)
+            x1 = min(W, W + dx)
+            sy0 = max(0, -dy)
+            sy1 = sy0 + (y1 - y0)
+            sx0 = max(0, -dx)
+            sx1 = sx0 + (x1 - x0)
+            shifted[y0:y1, x0:x1] = inp[sy0:sy1, sx0:sx1]
+            if np.array_equal(shifted, out):
+                return (dy, dx)
+    return None
+
+
+def detect_upscale(inp: np.ndarray, out: np.ndarray, max_scale: int = 5) -> tuple[int, int] | None:
+    """Detect integer nearest-neighbour upscaling."""
+    for sy in range(2, max_scale + 1):
+        for sx in range(2, max_scale + 1):
+            if np.array_equal(np.repeat(np.repeat(inp, sy, axis=0), sx, axis=1), out):
+                return (sy, sx)
+    return None
+
+
+def detect_trim_bbox(inp: np.ndarray, out: np.ndarray) -> tuple[int, int, int, int, int] | None:
+    """Detect crop to the bounding box of all pixels not equal to a background colour."""
+    for bg in range(10):
+        ys, xs = np.where(inp != bg)
+        if len(ys) == 0:
+            continue
+        y0, y1 = ys.min(), ys.max() + 1
+        x0, x1 = xs.min(), xs.max() + 1
+        if np.array_equal(inp[y0:y1, x0:x1], out):
+            return bg, y0, y1, x0, x1
+    return None
+
+
+def detect_spatial_color_transform(
+    inp: np.ndarray, out: np.ndarray
+) -> tuple[str, dict[int, int]] | None:
+    """
+    Detect a spatial transform followed by a consistent colour mapping.
+    Pure colour remaps are handled separately by ColorPermSolver, so this is
+    only used for non-identity spatial transforms.
+    """
+    for transform in [
+        "flip_h",
+        "flip_v",
+        "rotate_180",
+        "rotate_90",
+        "rotate_270",
+        "transpose",
+        "anti_transpose",
+    ]:
+        transformed = {
+            "flip_h": np.fliplr(inp),
+            "flip_v": np.flipud(inp),
+            "rotate_180": np.rot90(inp, 2),
+            "rotate_90": np.rot90(inp, 1),
+            "rotate_270": np.rot90(inp, 3),
+            "transpose": inp.T,
+            "anti_transpose": np.fliplr(inp.T),
+        }[transform]
+        mapping = detect_color_mapping(transformed, out)
+        if mapping is not None and any(mapping.get(c, c) != c for c in range(10)):
+            return transform, mapping
+    return None
+
+
 def detect_gravity_down(inp: np.ndarray, out: np.ndarray) -> bool:
     if inp.shape != out.shape:
         return False
@@ -271,6 +347,48 @@ def analyse_task(task: dict) -> dict[str, Any]:
     is_gravity_down = all(detect_gravity_down(i, o) for i, o in detect_pairs)
     is_gravity_up   = all(detect_gravity_up(i, o)   for i, o in detect_pairs)
 
+    # --- Translation (from train only) ---
+    translations = [detect_translation(i, o) for i, o in detect_pairs]
+    is_translation = all(t is not None for t in translations)
+    translation = None
+    if is_translation:
+        ref = translations[0]
+        is_translation = all(t == ref for t in translations[1:])
+        translation = ref if is_translation else None
+
+    # --- Integer upscaling (from train only) ---
+    upscales = [detect_upscale(i, o) for i, o in detect_pairs]
+    is_upscale = all(s is not None for s in upscales)
+    upscale_factor = None
+    if is_upscale:
+        ref = upscales[0]
+        is_upscale = all(s == ref for s in upscales[1:])
+        upscale_factor = ref if is_upscale else None
+
+    # --- Spatial transform + colour mapping (from train only) ---
+    spatial_color = [detect_spatial_color_transform(i, o) for i, o in detect_pairs]
+    is_spatial_color = all(sc is not None for sc in spatial_color)
+    spatial_color_transform = None
+    spatial_color_mapping = None
+    if is_spatial_color:
+        ref_t, ref_m = spatial_color[0]
+        is_spatial_color = all(t == ref_t and m == ref_m for t, m in spatial_color[1:])
+        if is_spatial_color:
+            spatial_color_transform = ref_t
+            spatial_color_mapping = ref_m
+
+    # --- Crop to non-background bounding box (from train only) ---
+    trim_bboxes = [detect_trim_bbox(i, o) for i, o in detect_pairs]
+    is_trim_bbox = all(tb is not None for tb in trim_bboxes)
+    trim_bbox_bg = None
+    trim_bbox_candidates = None
+    if is_trim_bbox:
+        ref_bg = trim_bboxes[0][0]
+        is_trim_bbox = all(tb[0] == ref_bg for tb in trim_bboxes[1:])
+        if is_trim_bbox:
+            trim_bbox_bg = ref_bg
+            trim_bbox_candidates = sorted({tb[1:] for tb in trim_bboxes})
+
     # --- Size info (train pairs only, for building fixed-size networks) ---
     train_in_shapes  = list({i.shape for i, o in detect_pairs})
     train_out_shapes = list({o.shape for i, o in detect_pairs})
@@ -283,6 +401,16 @@ def analyse_task(task: dict) -> dict[str, Any]:
         "tiling_factor":        tiling_factor,
         "gravity_down":         is_gravity_down,
         "gravity_up":           is_gravity_up,
+        "translation":          is_translation,
+        "translation_delta":    translation,
+        "upscale":              is_upscale,
+        "upscale_factor":       upscale_factor,
+        "trim_bbox":            is_trim_bbox,
+        "trim_bbox_bg":         trim_bbox_bg,
+        "trim_bbox_candidates": trim_bbox_candidates,
+        "spatial_color":        is_spatial_color,
+        "spatial_color_transform": spatial_color_transform,
+        "spatial_color_mapping": spatial_color_mapping,
         "same_io_shape":        all(i.shape == o.shape for i, o in detect_pairs),
         "input_shapes":         train_in_shapes,
         "output_shapes":        train_out_shapes,
