@@ -1,4 +1,40 @@
-numpy>=1.24.0
-onnx>=1.15.0
-onnxruntime>=1.17.0
-matplotlib>=3.7.0
+# ── Core ──────────────────────────────────────────────────────────────────────
+numpy>=1.26.0
+scipy>=1.12.0
+
+# ── PyTorch (CPU — no CUDA needed for tiny nets) ──────────────────────────────
+torch>=2.2.0
+torchvision>=0.17.0
+
+# ── ONNX ─────────────────────────────────────────────────────────────────────
+onnx>=1.16.0
+onnxruntime>=1.18.0
+
+# ── ONNX optimisation ─────────────────────────────────────────────────────────
+# onnxsim requires cmake — install separately if needed:
+#   brew install cmake && pip3 install onnxsim
+# It is optional; the code falls back gracefully if not present.
+onnxoptimizer>=0.3.13    # graph-level optimisation passes (no cmake needed)
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.8.0
+netron>=7.8.0            # interactive ONNX graph viewer
+
+# ── Notebooks ─────────────────────────────────────────────────────────────────
+jupyter>=1.0.0
+ipykernel>=6.29.0
+ipywidgets>=8.1.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.1.0
+pytest-cov>=5.0.0
+
+# ── Code quality ──────────────────────────────────────────────────────────────
+black>=24.4.0
+isort>=5.13.0
+ruff>=0.4.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm>=4.66.0             # progress bars
+rich>=13.7.0             # pretty terminal output
+kaggle>=1.6.0            # Kaggle CLI for downloading data

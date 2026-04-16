@@ -1,0 +1,439 @@
+from __future__ import annotations
+
+"""
+learned.py — Batched training fallback solver for NeuroGolf 2026.
+
+Two-stage strategy:
+  Stage 1: Train on TRAIN pairs only (3-5 examples, fast).
+           If pixel-perfect AND generalises to ALL → done.
+  Stage 2: Retrain on ALL pairs (train + test + arc-gen).
+
+Architecture search: smallest-first.
+  1×1 conv → 3×3 conv → 2-layer → 3-layer ...
+
+Training: Adam, cross-entropy, early-stop when pixel-perfect OR stagnation.
+
+Backend: tries PyTorch first (fast), falls back to NumPy (no CUDA needed).
+"""
+
+from pathlib import Path
+import numpy as np
+import onnx
+
+from solvers.base import BaseSolver
+from utils.arc_utils import grid_to_tensor, grid_to_array, CANVAS, C
+from utils.onnx_builder import save as onnx_save
+
+
+# ── Try to import PyTorch ──────────────────────────────────────────────────────
+
+def _try_import_torch():
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.optim as optim
+        _ = torch.zeros(2, 2)  # sanity check
+        return torch, nn, optim
+    except Exception:
+        return None, None, None
+
+
+# ── PyTorch models ────────────────────────────────────────────────────────────
+
+class _TorchConvNet:
+    def __init__(self, hidden, kernel, depth, torch, nn):
+        self.torch = torch
+        pad = kernel // 2
+        layers = []
+        in_c = C
+        for _ in range(depth - 1):
+            layers += [nn.Conv2d(in_c, hidden, kernel, padding=pad), nn.ReLU()]
+            in_c = hidden
+        layers.append(nn.Conv2d(in_c, C, kernel, padding=pad))
+        self.net = nn.Sequential(*layers)
+
+    def __call__(self, x):
+        return self.net(x)
+    def parameters(self):
+        return self.net.parameters()
+    def train(self):
+        self.net.train()
+    def eval(self):
+        self.net.eval()
+
+
+def _train_torch(model, X, Y, max_epochs, lr, torch, optim, nn,
+                 stagnation_patience=150):
+    loss_fn   = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    sched     = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=80, factor=0.5, min_lr=1e-5)
+    model.train()
+    best_loss = float("inf")
+    stall = 0
+    for epoch in range(max_epochs):
+        optimizer.zero_grad()
+        out  = model(X)
+        loss = loss_fn(out, Y)
+        loss.backward()
+        optimizer.step()
+        sched.step(loss)
+        l = loss.item()
+        if l < best_loss - 1e-4:
+            best_loss = l
+            stall = 0
+        else:
+            stall += 1
+            if stall >= stagnation_patience:
+                return False   # stuck — give up early
+        with torch.no_grad():
+            if torch.equal(out.argmax(dim=1), Y):
+                return True
+    return False
+
+
+def _is_exact_torch(model, X, Y, torch):
+    model.eval()
+    with torch.no_grad():
+        return torch.equal(model(X).argmax(dim=1), Y)
+
+
+def _export_torch(model, path, torch, onnx):
+    model.eval()
+    dummy = torch.zeros(1, C, CANVAS, CANVAS)
+    try:
+        torch.onnx.export(model.net, dummy, str(path),
+            input_names=["input"], output_names=["output"],
+            opset_version=17, dynamic_axes=None)
+        m = onnx.load(str(path))
+        onnx.checker.check_model(m)
+        onnx_save(m, str(path))
+        return True
+    except Exception as e:
+        print(f"      export error: {e}")
+        return False
+
+
+# ── Fast NumPy conv net ────────────────────────────────────────────────────────
+
+def _fast_conv2d_fwd(x, W, b, pad):
+    """
+    Fast batched conv2d using einsum over kernel positions.
+    x: [N, Cin, H, W], W: [Cout, Cin, kH, kW], b: [Cout]
+    Returns out [N, Cout, H, W]
+    """
+    N, Cin, H, Ww = x.shape
+    Cout, _, kH, kW = W.shape
+    xp = np.pad(x, ((0,0),(0,0),(pad,pad),(pad,pad)))
+    out = np.zeros((N, Cout, H, Ww), dtype=np.float32)
+    for i in range(kH):
+        for j in range(kW):
+            # xs: [N, Cin, H, W], wk: [Cout, Cin]
+            xs = xp[:, :, i:i+H, j:j+Ww]
+            wk = W[:, :, i, j]
+            # 'nchw,oc->nohw'
+            out += np.einsum('nchw,oc->nohw', xs, wk, optimize=True)
+    out += b[None, :, None, None]
+    return out
+
+
+def _fast_conv2d_bwd(dout, x, W, pad):
+    """
+    Backward pass for fast_conv2d.
+    Returns (dx, dW, db).
+    """
+    N, Cin, H, Ww = x.shape
+    Cout, _, kH, kW = W.shape
+    xp = np.pad(x, ((0,0),(0,0),(pad,pad),(pad,pad)))
+    dxp = np.zeros_like(xp)
+    dW  = np.zeros_like(W)
+    db  = dout.sum(axis=(0,2,3))
+
+    for i in range(kH):
+        for j in range(kW):
+            xs  = xp[:, :, i:i+H, j:j+Ww]
+            wk  = W[:, :, i, j]
+            # dW[:,:,i,j] = einsum('nohw,nchw->oc', dout, xs)
+            dW[:, :, i, j] = np.einsum('nohw,nchw->oc', dout, xs, optimize=True)
+            # dxp[:,:,i:i+H,j:j+W] += einsum('nohw,oc->nchw', dout, wk)
+            dxp[:, :, i:i+H, j:j+Ww] += np.einsum('nohw,oc->nchw', dout, wk, optimize=True)
+
+    dx = dxp[:, :, pad:pad+H, pad:pad+Ww]
+    return dx, dW, db
+
+
+class NumpyConvNet:
+    """Fast pure-numpy conv net using einsum-based forward/backward."""
+
+    def __init__(self, hidden, kernel, depth, seed=42):
+        np.random.seed(seed)
+        self.kernel = kernel
+        self.pad    = kernel // 2
+        self.depth  = depth
+        self.layers = []    # list of [W, b]
+        self.use_relu = []
+
+        in_c = C
+        for _ in range(depth - 1):
+            s = np.sqrt(2.0 / (in_c * kernel * kernel))
+            W = (np.random.randn(hidden, in_c, kernel, kernel) * s).astype(np.float32)
+            b = np.zeros(hidden, dtype=np.float32)
+            self.layers.append([W, b])
+            self.use_relu.append(True)
+            in_c = hidden
+        # output layer
+        s = np.sqrt(2.0 / (in_c * kernel * kernel))
+        W = (np.random.randn(C, in_c, kernel, kernel) * s).astype(np.float32)
+        b = np.zeros(C, dtype=np.float32)
+        self.layers.append([W, b])
+        self.use_relu.append(False)
+
+        # Adam state
+        self._adam_m = [[np.zeros_like(l[0]), np.zeros_like(l[1])] for l in self.layers]
+        self._adam_v = [[np.zeros_like(l[0]), np.zeros_like(l[1])] for l in self.layers]
+        self._adam_t = 0
+
+    def forward(self, x):
+        self._cache = []
+        cur = x
+        for i, ((W, b), use_r) in enumerate(zip(self.layers, self.use_relu)):
+            out = _fast_conv2d_fwd(cur, W, b, self.pad)
+            pre = out.copy()
+            if use_r:
+                out = np.maximum(0.0, out)
+            self._cache.append((cur, pre))
+            cur = out
+        return cur
+
+    def backward(self, dout):
+        grads = []
+        for i in range(len(self.layers) - 1, -1, -1):
+            x_in, pre_act = self._cache[i]
+            if self.use_relu[i]:
+                dout = dout * (pre_act > 0)
+            W, _ = self.layers[i]
+            dx, dW, db = _fast_conv2d_bwd(dout, x_in, W, self.pad)
+            grads.insert(0, (dW, db))
+            dout = dx
+        return grads
+
+    def step_adam(self, grads, lr):
+        self._adam_t += 1
+        t = self._adam_t
+        b1, b2, eps = 0.9, 0.999, 1e-8
+        for i, (dW, db) in enumerate(grads):
+            for j, d in enumerate([dW, db]):
+                self._adam_m[i][j] = b1 * self._adam_m[i][j] + (1-b1) * d
+                self._adam_v[i][j] = b2 * self._adam_v[i][j] + (1-b2) * d**2
+                mh = self._adam_m[i][j] / (1 - b1**t)
+                vh = self._adam_v[i][j] / (1 - b2**t)
+                self.layers[i][j] -= lr * mh / (np.sqrt(vh) + eps)
+
+    def predict(self, x):
+        return np.argmax(self.forward(x), axis=1)
+
+    def to_onnx(self, path):
+        from onnx import numpy_helper, TensorProto, helper as oh
+        nodes, inits = [], []
+        cur = "input"
+        for i, ((W, b), use_r) in enumerate(zip(self.layers, self.use_relu)):
+            w_n, b_n = f"l{i}_W", f"l{i}_b"
+            o_n = f"l{i}_conv"
+            inits += [numpy_helper.from_array(W.astype(np.float32), w_n),
+                      numpy_helper.from_array(b.astype(np.float32), b_n)]
+            nodes.append(oh.make_node("Conv",
+                inputs=[cur, w_n, b_n], outputs=[o_n],
+                kernel_shape=[self.kernel, self.kernel],
+                pads=[self.pad]*4))
+            if use_r:
+                r_n = f"l{i}_relu"
+                nodes.append(oh.make_node("Relu", inputs=[o_n], outputs=[r_n]))
+                cur = r_n
+            else:
+                cur = o_n
+        graph = oh.make_graph(nodes, "learned",
+            [oh.make_tensor_value_info("input",  TensorProto.FLOAT, [1,C,CANVAS,CANVAS])],
+            [oh.make_tensor_value_info(cur,      TensorProto.FLOAT, [1,C,CANVAS,CANVAS])],
+            inits)
+        model = oh.make_model(graph, opset_imports=[oh.make_opsetid("",17)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx_save(model, str(path))
+        return True
+
+
+# ── Dataset builder ────────────────────────────────────────────────────────────
+
+def make_batch_np(pairs):
+    xs, ys = [], []
+    for p in pairs:
+        xs.append(grid_to_tensor(p["input"]))
+        out = grid_to_array(p["output"])
+        H, W = out.shape
+        tgt = np.zeros((CANVAS, CANVAS), dtype=np.int64)
+        tgt[:H, :W] = out
+        ys.append(tgt)
+    X = np.concatenate(xs, axis=0)       # [N,10,30,30]
+    Y = np.stack(ys, axis=0)             # [N,30,30]
+    return X, Y
+
+
+def _cross_entropy(logits, targets):
+    """logits [N,C,H,W], targets [N,H,W] → scalar loss, dlogits"""
+    e = np.exp(logits - logits.max(axis=1, keepdims=True))
+    probs = e / e.sum(axis=1, keepdims=True)
+    N, Cc, H, W = logits.shape
+    oh = np.zeros_like(probs)
+    oh[np.arange(N)[:, None, None], targets,
+       np.arange(H)[None, :, None], np.arange(W)[None, None, :]] = 1.0
+    loss = -np.mean(np.log(probs.clip(1e-9)) * oh)
+    grad = (probs - oh) / (N * H * W)
+    return loss, grad
+
+
+# ── Architecture search ────────────────────────────────────────────────────────
+
+ARCHS = [
+    (C,  1, 1),    # 1×1: colour map only (fastest)
+    (C,  3, 1),    # 3×3 single
+    (16, 3, 2),    # 2-layer 3×3
+    (C,  5, 1),    # 5×5 single
+    (32, 3, 2),    # wider 2-layer
+    (16, 5, 2),    # 2-layer 5×5
+    (C,  7, 1),    # 7×7 single
+    (16, 3, 3),    # 3-layer 3×3
+    (32, 3, 3),    # wider 3-layer
+]
+
+
+# ── Training ───────────────────────────────────────────────────────────────────
+
+def _train_numpy(model, X, Y, max_epochs=600, lr=3e-3, stagnation=120):
+    """Train NumpyConvNet. Returns True when pixel-perfect."""
+    best_loss = np.inf
+    stall = 0
+    cur_lr = lr
+    lr_patience = 80
+    lr_stall = 0
+
+    for epoch in range(max_epochs):
+        logits = model.forward(X)
+        loss, dlogits = _cross_entropy(logits, Y)
+        grads = model.backward(dlogits)
+        model.step_adam(grads, cur_lr)
+
+        if loss < best_loss - 1e-4:
+            best_loss = loss
+            stall = 0
+            lr_stall = 0
+        else:
+            stall += 1
+            lr_stall += 1
+            if stall >= stagnation:
+                return False
+            if lr_stall >= lr_patience:
+                cur_lr = max(cur_lr * 0.5, 1e-5)
+                lr_stall = 0
+
+        if np.array_equal(np.argmax(logits, axis=1), Y):
+            return True
+
+    return False
+
+
+# ── Solver ─────────────────────────────────────────────────────────────────────
+
+class LearnedSolver(BaseSolver):
+    PRIORITY = 90   # last resort
+
+    def can_solve(self, _):
+        return True
+
+    def build(self, task_id, task, analysis, out_dir):
+        train_pairs  = task.get("train",   [])
+        test_pairs   = task.get("test",    [])
+        arcgen_pairs = task.get("arc-gen", [])
+        all_pairs    = train_pairs + test_pairs + arcgen_pairs
+
+        if not train_pairs:
+            return None
+
+        # Skip tasks with grids larger than the 30×30 canvas
+        for p in all_pairs:
+            H = len(p["input"]); W = len(p["input"][0])
+            if H > CANVAS or W > CANVAS:
+                return None
+            oH = len(p["output"]); oW = len(p["output"][0])
+            if oH > CANVAS or oW > CANVAS:
+                return None
+
+        torch_mod, nn_mod, optim_mod = _try_import_torch()
+        if torch_mod is not None:
+            return self._build_torch(task_id, all_pairs, train_pairs, out_dir,
+                                     torch_mod, nn_mod, optim_mod)
+        else:
+            return self._build_numpy(task_id, all_pairs, train_pairs, out_dir)
+
+    # ── PyTorch path ────────────────────────────────────────────────────────
+
+    def _build_torch(self, task_id, all_pairs, train_pairs, out_dir, torch, nn, optim):
+        X_tr = torch.from_numpy(make_batch_np(train_pairs)[0])
+        Y_tr = torch.from_numpy(make_batch_np(train_pairs)[1])
+        X_all_np, Y_all_np = make_batch_np(all_pairs)
+        X_all = torch.from_numpy(X_all_np)
+        Y_all = torch.from_numpy(Y_all_np)
+        path = out_dir / f"{task_id}.onnx"
+
+        for hidden, kernel, depth in ARCHS:
+            label = f"h={hidden} k={kernel} d={depth}"
+
+            # Stage 1: train-only
+            model = _TorchConvNet(hidden, kernel, depth, torch, nn)
+            if not _train_torch(model, X_tr, Y_tr, 600, 3e-3, torch, optim, nn):
+                continue
+            if _is_exact_torch(model, X_all, Y_all, torch):
+                if _export_torch(model, path, torch, onnx):
+                    print(f"      ✓ {label}  (stage-1 generalised)")
+                    return path
+
+            # Stage 2: all-pairs
+            model2 = _TorchConvNet(hidden, kernel, depth, torch, nn)
+            if _train_torch(model2, X_all, Y_all, 1200, 1e-3, torch, optim, nn):
+                if _export_torch(model2, path, torch, onnx):
+                    print(f"      ✓ {label}  (stage-2 all-pairs)")
+                    return path
+        return None
+
+    # ── NumPy path ──────────────────────────────────────────────────────────
+
+    def _build_numpy(self, task_id, all_pairs, train_pairs, out_dir):
+        X_tr, Y_tr = make_batch_np(train_pairs)
+        X_all, Y_all = make_batch_np(all_pairs)
+        path = out_dir / f"{task_id}.onnx"
+
+        for hidden, kernel, depth in ARCHS:
+            label = f"h={hidden} k={kernel} d={depth}"
+
+            # Stage 1: train-only (fast, few pairs)
+            model = NumpyConvNet(hidden, kernel, depth, seed=42)
+            if not _train_numpy(model, X_tr, Y_tr, max_epochs=600, lr=3e-3):
+                continue
+            if np.array_equal(model.predict(X_all), Y_all):
+                try:
+                    model.to_onnx(path)
+                    print(f"      ✓ {label}  (stage-1 generalised, numpy)")
+                    return path
+                except Exception as e:
+                    print(f"      export error: {e}")
+
+            # Stage 2: all-pairs (slower)
+            model2 = NumpyConvNet(hidden, kernel, depth, seed=42)
+            if _train_numpy(model2, X_all, Y_all, max_epochs=1200, lr=1e-3):
+                try:
+                    model2.to_onnx(path)
+                    print(f"      ✓ {label}  (stage-2 all-pairs, numpy)")
+                    return path
+                except Exception as e:
+                    print(f"      export error: {e}")
+
+        return None
