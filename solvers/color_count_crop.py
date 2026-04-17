@@ -7,7 +7,7 @@ from onnx import TensorProto, helper
 
 from solvers.base import BaseSolver
 from utils.arc_utils import detect_color_count_crop, grid_to_array
-from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, _t, save
+from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, _t, save, static_crop_shift_nodes
 
 
 def _color_count_crop_net(mode: str) -> onnx.ModelProto:
@@ -98,50 +98,27 @@ def _color_count_crop_net(mode: str) -> onnx.ModelProto:
     )
     reduce_max("ccc_col_last_candidates", "ccc_x1", [1], keepdims=0)
 
-    inits += [
-        _make_int64("ccc_row_axis", [2]),
-        _make_int64("ccc_col_axis", [3]),
-        _make_int64("ccc_step", [1]),
-    ]
-    nodes.append(
-        helper.make_node(
-            "Slice",
-            inputs=["ccc_sel", "ccc_y0", "ccc_y1", "ccc_row_axis", "ccc_step"],
-            outputs=["ccc_rows"],
-        )
+    # Static crop-and-shift via MatMul (all shapes stay [30,30])
+    sn, si = static_crop_shift_nodes(
+        "ccc_sel", "ccc_mask_padded",
+        "ccc_y0", "ccc_y1", "ccc_x0", "ccc_x1",
+        prefix="ccc_sc",
     )
-    nodes.append(
-        helper.make_node(
-            "Slice",
-            inputs=["ccc_rows", "ccc_x0", "ccc_x1", "ccc_col_axis", "ccc_step"],
-            outputs=["ccc_crop"],
-        )
-    )
+    nodes += sn
+    inits += si
 
-    nodes.append(helper.make_node("Sub", inputs=["ccc_y1", "ccc_y0"], outputs=["ccc_h"]))
-    nodes.append(helper.make_node("Sub", inputs=["ccc_x1", "ccc_x0"], outputs=["ccc_w"]))
+    # One-hot color mask using Relu arithmetic (avoids Equal + Cast-from-bool)
     inits += [
-        _make_int64("ccc_canvas_i", [CANVAS]),
-        _make_int64("ccc_pad_prefix", [0, 0, 0, 0, 0, 0]),
-    ]
-    nodes.append(helper.make_node("Sub", inputs=["ccc_canvas_i", "ccc_h"], outputs=["ccc_bottom"]))
-    nodes.append(helper.make_node("Sub", inputs=["ccc_canvas_i", "ccc_w"], outputs=["ccc_right"]))
-    nodes.append(
-        helper.make_node(
-            "Concat", inputs=["ccc_pad_prefix", "ccc_bottom", "ccc_right"], outputs=["ccc_pads"], axis=0
-        )
-    )
-    nodes.append(helper.make_node("Pad", inputs=["ccc_crop", "ccc_pads"], outputs=["ccc_mask_padded"], mode="constant"))
-
-    inits += [
-        _make_int64("ccc_color_ids", list(range(C))),
+        _make_float("ccc_color_ids_f", list(range(C))),   # [0.0, 1.0, ..., 9.0]
+        _make_float("ccc_color_ones_f", [1.0]),             # scalar 1.0
         _make_int64("ccc_color_shape", [1, C, 1, 1]),
     ]
-    nodes.append(helper.make_node("Equal", inputs=["ccc_color_ids", "ccc_color_idx"], outputs=["ccc_color_b"]))
-    nodes.append(helper.make_node("Cast", inputs=["ccc_color_b"], outputs=["ccc_color_f"], to=TensorProto.FLOAT))
-    nodes.append(
-        helper.make_node("Reshape", inputs=["ccc_color_f", "ccc_color_shape"], outputs=["ccc_color_mask"])
-    )
+    nodes.append(helper.make_node("Cast", inputs=["ccc_color_idx"], outputs=["ccc_color_idx_f"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Sub", inputs=["ccc_color_ids_f", "ccc_color_idx_f"], outputs=["ccc_color_diff"]))
+    nodes.append(helper.make_node("Abs", inputs=["ccc_color_diff"], outputs=["ccc_color_abs"]))
+    nodes.append(helper.make_node("Sub", inputs=["ccc_color_ones_f", "ccc_color_abs"], outputs=["ccc_color_hot_raw"]))
+    nodes.append(helper.make_node("Relu", inputs=["ccc_color_hot_raw"], outputs=["ccc_color_f"]))
+    nodes.append(helper.make_node("Reshape", inputs=["ccc_color_f", "ccc_color_shape"], outputs=["ccc_color_mask"]))
     nodes.append(helper.make_node("Mul", inputs=["ccc_color_mask", "ccc_mask_padded"], outputs=["output"]))
 
     graph = helper.make_graph(

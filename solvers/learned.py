@@ -40,17 +40,63 @@ def _try_import_torch():
 
 # ── PyTorch models ────────────────────────────────────────────────────────────
 
-class _TorchConvNet:
-    def __init__(self, hidden, kernel, depth, torch, nn):
+class _CoordResNet:
+    def __init__(self, hidden, kernel, depth, torch, nn, use_coords=False, residual=False):
         self.torch = torch
+        self.use_coords = use_coords
         pad = kernel // 2
-        layers = []
-        in_c = C
-        for _ in range(depth - 1):
-            layers += [nn.Conv2d(in_c, hidden, kernel, padding=pad), nn.ReLU()]
-            in_c = hidden
-        layers.append(nn.Conv2d(in_c, C, kernel, padding=pad))
-        self.net = nn.Sequential(*layers)
+
+        class _Net(nn.Module):
+            def __init__(self, hidden, kernel, depth, use_coords, residual):
+                super().__init__()
+                in_c = C + (2 if use_coords else 0)
+                self.use_coords = use_coords
+                pad = kernel // 2
+
+                class _ResidualModule(nn.Module):
+                    def __init__(self):
+                        super().__init__()
+                        self.block = nn.Sequential(
+                            nn.Conv2d(hidden, hidden, kernel, padding=pad),
+                            nn.ReLU(),
+                            nn.Conv2d(hidden, hidden, kernel, padding=pad),
+                        )
+                        self.relu = nn.ReLU()
+
+                    def forward(self, x):
+                        return self.relu(x + self.block(x))
+
+                if use_coords:
+                    ys = torch.linspace(-1.0, 1.0, CANVAS, dtype=torch.float32).view(1, 1, CANVAS, 1).expand(1, 1, CANVAS, CANVAS)
+                    xs = torch.linspace(-1.0, 1.0, CANVAS, dtype=torch.float32).view(1, 1, 1, CANVAS).expand(1, 1, CANVAS, CANVAS)
+                    self.register_buffer("coord_y", ys)
+                    self.register_buffer("coord_x", xs)
+
+                layers = []
+                if residual:
+                    layers.append(nn.Conv2d(in_c, hidden, kernel, padding=pad))
+                    layers.append(nn.ReLU())
+                    for _ in range(max(depth - 2, 1)):
+                        layers.append(_ResidualModule())
+                    layers.append(nn.Conv2d(hidden, C, kernel, padding=pad))
+                else:
+                    cur_c = in_c
+                    for _ in range(depth - 1):
+                        layers += [nn.Conv2d(cur_c, hidden, kernel, padding=pad), nn.ReLU()]
+                        cur_c = hidden
+                    layers.append(nn.Conv2d(cur_c, C, kernel, padding=pad))
+                self.net = nn.Sequential(*layers)
+
+            def forward(self, x):
+                if self.use_coords:
+                    n = x.shape[0]
+                    x = torch.cat(
+                        [x, self.coord_y.expand(n, -1, -1, -1), self.coord_x.expand(n, -1, -1, -1)],
+                        dim=1,
+                    )
+                return self.net(x)
+
+        self.net = _Net(hidden, kernel, depth, use_coords, residual)
 
     def __call__(self, x):
         return self.net(x)
@@ -319,6 +365,10 @@ ARCH_TRIALS = [
     {"hidden": 32, "kernel": 5, "depth": 3, "restarts": 1, "stage1_epochs": 650, "stage2_epochs": 1300},
     {"hidden": 64, "kernel": 3, "depth": 3, "restarts": 1, "stage1_epochs": 650, "stage2_epochs": 1300},
     {"hidden": C,  "kernel": 9, "depth": 1, "restarts": 1, "stage1_epochs": 550, "stage2_epochs": 1100},
+    {"hidden": 32, "kernel": 3, "depth": 4, "restarts": 1, "stage1_epochs": 700, "stage2_epochs": 1400, "use_coords": True},
+    {"hidden": 64, "kernel": 3, "depth": 4, "restarts": 1, "stage1_epochs": 750, "stage2_epochs": 1500, "use_coords": True},
+    {"hidden": 32, "kernel": 5, "depth": 4, "restarts": 1, "stage1_epochs": 750, "stage2_epochs": 1500, "use_coords": True},
+    {"hidden": 64, "kernel": 3, "depth": 4, "restarts": 1, "stage1_epochs": 800, "stage2_epochs": 1600, "use_coords": True, "residual": True},
 ]
 
 
@@ -408,8 +458,8 @@ class LearnedSolver(BaseSolver):
         Y_all = torch.from_numpy(Y_all_np)
         path = out_dir / f"{task_id}.onnx"
 
-        # Per-task deadline: 180 seconds total
-        task_deadline = time.time() + 180.0
+        # Per-task deadline: 300 seconds total
+        task_deadline = time.time() + 300.0
 
         for trial in ARCH_TRIALS:
             if time.time() > task_deadline:
@@ -417,14 +467,16 @@ class LearnedSolver(BaseSolver):
             hidden = trial["hidden"]
             kernel = trial["kernel"]
             depth = trial["depth"]
+            use_coords = bool(trial.get("use_coords"))
+            residual = bool(trial.get("residual"))
             for seed in range(trial["restarts"]):
                 if time.time() > task_deadline:
                     break
                 torch.manual_seed(seed)
-                label = f"h={hidden} k={kernel} d={depth} s={seed}"
+                label = f"h={hidden} k={kernel} d={depth} s={seed}" + (" coord" if use_coords else "") + (" res" if residual else "")
 
                 # Stage 1: train-only
-                model = _TorchConvNet(hidden, kernel, depth, torch, nn)
+                model = _CoordResNet(hidden, kernel, depth, torch, nn, use_coords=use_coords, residual=residual)
                 if not _train_torch(
                     model, X_tr, Y_tr, trial["stage1_epochs"], 3e-3, torch, optim, nn,
                     deadline=task_deadline
@@ -438,9 +490,21 @@ class LearnedSolver(BaseSolver):
                 if time.time() > task_deadline:
                     break
 
-                # Stage 2: all-pairs
+                # Stage 1.5: continue from the train-fit model on all known pairs.
+                if _train_torch(
+                    model, X_all, Y_all, trial["stage2_epochs"], 1e-3, torch, optim, nn,
+                    deadline=task_deadline
+                ):
+                    if _export_torch(model, path, torch, onnx):
+                        print(f"      ✓ {label}  (stage-1.5 finetuned all-pairs)")
+                        return path
+
+                if time.time() > task_deadline:
+                    break
+
+                # Stage 2: fresh all-pairs fit
                 torch.manual_seed(seed + 1000)
-                model2 = _TorchConvNet(hidden, kernel, depth, torch, nn)
+                model2 = _CoordResNet(hidden, kernel, depth, torch, nn, use_coords=use_coords, residual=residual)
                 if _train_torch(
                     model2, X_all, Y_all, trial["stage2_epochs"], 1e-3, torch, optim, nn,
                     deadline=task_deadline

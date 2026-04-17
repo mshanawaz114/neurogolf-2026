@@ -68,6 +68,78 @@ make zip
 # → submission.zip ready to upload to Kaggle
 ```
 
+### Kaggle-Safe Recovery Build
+
+When Kaggle rejects a submission with `Error processing one or more onnx networks`,
+use the full safe builder instead of hand-editing the zip:
+
+```bash
+python3 scripts/build_safe_submission.py
+
+# or
+make safe-zip
+
+# build the stronger static-shape candidate that keeps the two gravity tasks
+python3 scripts/build_safe_submission.py --profile static23
+
+# or
+make static23-zip
+```
+
+That script:
+
+- keeps only generated task ONNX files whose operator sets stay inside the current conservative allowlist
+- fills every other task with a safe identity fallback
+- writes a full `400`-file package to `submission_full_safe.zip`
+- writes an audit trail to `safe_submission_report.csv`
+
+Current conservative allowlist:
+`Add`, `Clip`, `Concat`, `Conv`, `Mul`, `Pad`, `ReduceMax`, `Resize`, `Slice`, `Sub`, `Transpose`
+
+Current `static23` allowlist:
+the conservative set plus
+`Cast`, `CumSum`, `Equal`, `ReduceSum`, `Unsqueeze`
+
+The builder also supports exact task-level ablations, which is useful when
+multiple risky solver families share the same operator set:
+
+```bash
+python3 scripts/build_safe_submission.py --profile static23 \
+  --force-keep-task task300 \
+  --force-keep-task task310
+```
+
+That lets you test a specific task or small family on Kaggle without turning on
+every model that uses the same risky operators.
+
+Based on the repo's April 17, 2026 Kaggle runs, treat a full `400`-file zip as required.
+That is an inference from observed behavior:
+
+- partial zips returned `400 Bad Request`
+- some full zips uploaded but later failed ONNX processing
+- only full packages can currently be trusted as real submission candidates
+
+Suggested recovery workflow:
+
+```bash
+# 1. Solve tasks locally
+python3 scripts/solve_all.py --no-learned
+
+# 2. Build a Kaggle-safe full package
+python3 scripts/build_safe_submission.py
+
+# or build the stronger static-shape candidate
+python3 scripts/build_safe_submission.py --profile static23
+
+# 3. Inspect what was kept vs downgraded
+sed -n '1,40p' safe_submission_report.csv
+
+# 4. Submit the safe full zip
+./.venv/bin/kaggle competitions submit -c neurogolf-2026 \
+  -f submission_full_safe.zip \
+  -m "Full safe fallback: 400 files, conservative ops only"
+```
+
 ### Fast Repo Check
 
 Use this before and after experiments so it is obvious what changed:
@@ -144,6 +216,12 @@ See [agent.md](agent.md) for the full technical specification.
 | `TilingSolver` | 8 | Concat + Pad (zero MACs) | ~21+ |
 | `ColorPermSolver` | 10 | 1×1 Conv with 10×10 weight matrix | ~13.6 |
 | `TranslateSolver` | 12 | Slice + Pad translation (zero MACs) | ~21+ |
+| `SelfKronMaskSolver` | 13 | Tile input by its own non-zero mask (`kron(mask,input)`) | ~21+ |
+| `ColorHoleFillSolver` | 13 | Fill holes inside a single-colour boundary mask via border flood fill | ~11.9 |
+| `CornerRectFillSolver` | 13 | Fill rectangle interiors implied by same-colour corner markers | ~12.7 |
+| `HorizontalGapFillSolver` | 13 | Fill one-cell horizontal gaps between matching pixels on the same row | ~17.0 |
+| `LCornerFillSolver` | 13 | Complete the missing corner of 2x2 L-shaped triominoes | ~15.4 |
+| `BounceSeedSolver` | 13 | Expand a bottom-left seed into a triangular-wave bounce path by width | ~12.1 |
 | `ColorBBoxCropSolver` | 14 | Select non-zero colour by bbox size and crop its mask | ~19-21 |
 | `ColorBBoxPreserveFlipSolver` | 14 | Select non-zero colour by bbox size, crop its subgrid, then flip | ~20-21 |
 | `ColorCountCropSolver` | 14 | Select min/max-frequency non-zero colour and crop its bbox | ~19-21 |
@@ -158,12 +236,24 @@ See [agent.md](agent.md) for the full technical specification.
 
 As of the current repo state, the deterministic stack validates exactly on:
 
-`task014`, `task031`, `task032`, `task036`, `task049`, `task053`,
-`task078`, `task087`, `task135`, `task140`, `task150`, `task155`,
-`task177`, `task179`, `task223`, `task241`, `task276`, `task300`,
-`task307`, `task309`, `task310`, `task326`
+`task001`, `task002`, `task014`, `task031`, `task032`, `task036`,
+`task049`, `task053`, `task078`, `task081`, `task087`, `task135`,
+`task140`, `task150`, `task155`, `task177`, `task179`, `task223`,
+`task241`, `task248`, `task251`, `task258`, `task273`, `task276`,
+`task300`, `task307`, `task309`, `task310`, `task326`
 
-That is `22` exact solves before counting any learned-fallback wins.
+That is `29` exact solves before counting any learned-fallback wins, with a
+current deterministic total of `501.01` points.
+
+### Current Kaggle Reality
+
+Local deterministic score and accepted Kaggle score are not the same thing.
+
+- Current best local deterministic total: `501.01`
+- Current accepted Kaggle score: `177.23`
+
+The gap exists because several stronger ONNX models still fail Kaggle processing.
+Until the submission pipeline is stable, optimize for accepted full packages first.
 
 ### What To Detect First
 
@@ -173,11 +263,13 @@ When inspecting a new task, check these in order:
    `flip`, `rotate`, `transpose`
 2. Pure colour remap:
    positions unchanged, colours differ
-3. Size-changing but structural transform:
+3. Same-shape structural fill:
+   hole fill inside a single-colour boundary, or self-mask Kronecker tiling
+4. Size-changing but structural transform:
    tiling, translation, integer upscale, bbox crop
-4. Variable-size spatial family:
+5. Variable-size spatial family:
    if train works but `arc-gen` changes size, assume you need a multi-shape analytical ONNX
-5. Only after those fail, spend time on learned fallback or one-off task logic
+6. Only after those fail, spend time on learned fallback or one-off task logic
 
 ### Current Bottleneck
 

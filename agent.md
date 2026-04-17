@@ -33,11 +33,11 @@ Design the **smallest possible ONNX neural networks** that correctly solve ARC-A
 
 | Rank | Team | Score | Entries |
 |---|---|---|---|
-| 1 | Kameron Kilchrist | 1339.96 | 2 |
-| 2 | Ali | 725.80 | 5 |
-| 3 | Sergey Kuznetsov | 688.47 | 2 |
-| Best public notebook | — | 210.46 | — |
-| Baseline notebook | — | 132.78 | — |
+| 1 | Maciej Sypetkowski | 4633.92 | 7 |
+| 2 | shinh | 4630.08 | 4 |
+| 3 | public leaderboard pace | ~4600+ | — |
+| Best accepted repo submission so far | — | 177.23 | — |
+| Strongest local deterministic total so far | — | 501.01 | — |
 
 Maximum possible score: **400 tasks × 25 pts = 10,000 pts**
 
@@ -140,7 +140,18 @@ submission.zip
 └── task400.onnx
 ```
 
-Partial submissions are valid. Build: `make zip`
+Treat full `400`-file submissions as required unless Kaggle proves otherwise.
+This is based on current observed behavior:
+
+- partial zips returned `400 Bad Request` at submit time
+- some full zips uploaded successfully but later failed ONNX processing
+- only a full package has produced an accepted Kaggle score so far
+
+Build the standard package with `make zip`, or use the safer recovery path:
+
+```bash
+python3 scripts/build_safe_submission.py
+```
 
 ---
 
@@ -167,6 +178,78 @@ Score per task: ~**13.6**
 Handles zero-filled translations on same-sized grids.
 Uses `Slice` + `Pad` analytically — **zero MACs**.
 Score per task: ~**21+**
+
+### Priority 13 — `SelfKronMaskSolver`
+Handles tasks where the output is the Kronecker-style tiling of the full input
+selected by the input's own non-zero mask:
+`output = kron(input != 0, input)`
+
+Uses a tiled input crop plus a nearest-neighbour-expanded non-zero mask.
+Score per task: usually **21+**
+
+### Priority 13 — `ColorHoleFillSolver`
+Handles tasks where the input contains a single non-zero boundary colour and the
+output fills its enclosed holes with a new colour.
+
+Uses border-seeded flood fill over the non-boundary region, then converts the
+unreachable remainder into the fill colour.
+Score per task: usually **11.9**
+
+### Priority 13 — `CornerRectFillSolver`
+Handles tasks where one non-zero colour marks the four corners of one or more
+axis-aligned rectangles, and the output fills each rectangle interior with a
+single new colour.
+
+Uses a small bank of rectangle-size-specific corner detectors followed by
+`ConvTranspose` interior fill kernels.
+Score per task: usually **12.7**
+
+### Priority 13 — `HorizontalGapFillSolver`
+Handles tasks where a single colour gains fill pixels exactly in one-cell
+horizontal gaps between two matching pixels on the same row.
+
+Uses a `1x3` analytical detector on the source colour channel plus an open-cell
+mask to ensure only true gaps are filled.
+Score per task: usually **17.0**
+
+### Priority 13 — `LCornerFillSolver`
+Handles tasks where a single colour forms 3 cells of a 2x2 block and the
+output fills the missing corner with a new colour.
+
+Uses four orientation-specific `2x2` detectors and shifted placement masks to
+complete the missing corner analytically.
+Score per task: usually **15.4**
+
+### Priority 13 — `BounceSeedSolver`
+Handles tasks where a single bottom-left seed expands into a deterministic
+triangular-wave bounce path whose period depends on the grid width.
+
+Uses width selection from the fixed one-hot canvas plus width-specific constant
+pattern outputs.
+Score per task: usually **12.1**
+
+### Priority 999 — Safe Submission Fallback
+This is not a task solver. It is a submission-recovery mechanism.
+
+The safe builder keeps only ONNX files whose operator sets stay inside the
+current conservative allowlist:
+
+`Add`, `Clip`, `Concat`, `Conv`, `Mul`, `Pad`, `ReduceMax`, `Resize`, `Slice`, `Sub`, `Transpose`
+
+Every remaining task is filled with a safe identity network so the zip still
+contains all `400` required files.
+
+Current usage:
+
+```bash
+python3 scripts/build_safe_submission.py
+```
+
+Outputs:
+
+- `onnx_safe_full/`
+- `safe_submission_report.csv`
+- `submission_full_safe.zip`
 
 ### Priority 14 — `ColorCountCropSolver`
 Handles tasks where the output is the bounding-box crop of the selected non-zero colour:
@@ -240,12 +323,15 @@ Score per task: ~**8–13** depending on architecture needed.
 
 The current deterministic stack validates exactly on:
 
-`task014`, `task031`, `task032`, `task036`, `task049`, `task053`,
-`task078`, `task087`, `task135`, `task140`, `task150`, `task155`,
-`task177`, `task179`, `task223`, `task241`, `task276`, `task300`,
-`task307`, `task309`, `task310`, `task326`
+`task001`, `task002`, `task014`, `task031`, `task032`, `task036`,
+`task049`, `task053`, `task078`, `task081`, `task087`, `task135`,
+`task140`, `task150`, `task155`, `task177`, `task179`, `task223`,
+`task241`, `task248`, `task251`, `task258`, `task273`, `task276`,
+`task300`, `task307`, `task309`, `task310`, `task326`
 
-Current exact solved count: **22**
+Current exact solved count: **29**
+
+Current deterministic total: **501.01**
 
 This is still far from leaderboard-contending coverage, but it is the current
 stable analytical base.
@@ -273,6 +359,7 @@ neurogolf-2026/
 │   ├── color_perm.py         ← ColorPermSolver (1×1 conv)
 │   ├── tiling.py             ← TilingSolver
 │   ├── translate.py          ← TranslateSolver
+│   ├── self_kron_mask.py     ← SelfKronMaskSolver
 │   ├── color_bbox_crop.py    ← ColorBBoxCropSolver
 │   ├── color_bbox_preserve_flip.py ← ColorBBoxPreserveFlipSolver
 │   ├── color_count_crop.py   ← ColorCountCropSolver
