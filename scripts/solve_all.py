@@ -33,6 +33,12 @@ from solvers.spatial_color import SpatialColorSolver
 from solvers.color_perm import ColorPermSolver
 from solvers.tiling     import TilingSolver
 from solvers.translate  import TranslateSolver
+from solvers.self_kron_mask import SelfKronMaskSolver
+from solvers.color_hole_fill import ColorHoleFillSolver
+from solvers.corner_rect_fill import CornerRectFillSolver
+from solvers.horizontal_gap_fill import HorizontalGapFillSolver
+from solvers.lcorner_fill import LCornerFillSolver
+from solvers.bounce_seed import BounceSeedSolver
 from solvers.color_bbox_crop import ColorBBoxCropSolver
 from solvers.color_bbox_preserve_flip import ColorBBoxPreserveFlipSolver
 from solvers.color_count_crop import ColorCountCropSolver
@@ -50,6 +56,12 @@ ALL_SOLVERS = [
     ColorPermSolver(),
     TilingSolver(),
     TranslateSolver(),
+    SelfKronMaskSolver(),
+    ColorHoleFillSolver(),
+    CornerRectFillSolver(),
+    HorizontalGapFillSolver(),
+    LCornerFillSolver(),
+    BounceSeedSolver(),
     ColorBBoxCropSolver(),
     ColorBBoxPreserveFlipSolver(),
     ColorCountCropSolver(),

@@ -7,7 +7,7 @@ from onnx import TensorProto, helper
 
 from solvers.base import BaseSolver
 from utils.arc_utils import detect_color_bbox_crop, grid_to_array
-from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, _t, save
+from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, _t, save, static_crop_shift_nodes
 
 
 def _color_bbox_crop_net(mode: str) -> onnx.ModelProto:
@@ -73,10 +73,6 @@ def _color_bbox_crop_net(mode: str) -> onnx.ModelProto:
     for src, dst in [
         ("cbc_area_all", "cbc_area_nonbg"),
         ("cbc_counts_all", "cbc_counts_nonbg"),
-        ("cbc_y0_all", "cbc_y0_nonbg"),
-        ("cbc_y1_all", "cbc_y1_nonbg"),
-        ("cbc_x0_all", "cbc_x0_nonbg"),
-        ("cbc_x1_all", "cbc_x1_nonbg"),
     ]:
         nodes.append(
             helper.make_node("Slice", inputs=[src, "cbc_cstart", "cbc_cend", "cbc_caxis", "cbc_cstep"], outputs=[dst])
@@ -144,35 +140,33 @@ def _color_bbox_crop_net(mode: str) -> onnx.ModelProto:
     )
     reduce_max("cbc_x1_candidates", "cbc_x1", [1], keepdims=0)
 
-    inits += [
-        _make_int64("cbc_row_axis", [2]),
-        _make_int64("cbc_col_axis", [3]),
-        _make_int64("cbc_step", [1]),
-    ]
-    nodes.append(
-        helper.make_node("Slice", inputs=["cbc_sel", "cbc_y0", "cbc_y1", "cbc_row_axis", "cbc_step"], outputs=["cbc_rows"])
+    # Static crop-and-shift via MatMul (all shapes stay [30,30])
+    sn, si = static_crop_shift_nodes(
+        "cbc_sel", "cbc_mask_padded",
+        "cbc_y0", "cbc_x0", "cbc_x0", "cbc_x1",  # Note: pass y0,y1,x0,x1 correctly below
+        prefix="cbc_sc",
     )
-    nodes.append(
-        helper.make_node("Slice", inputs=["cbc_rows", "cbc_x0", "cbc_x1", "cbc_col_axis", "cbc_step"], outputs=["cbc_crop"])
+    # Redo: correct argument order
+    sn, si = static_crop_shift_nodes(
+        "cbc_sel", "cbc_mask_padded",
+        "cbc_y0", "cbc_y1", "cbc_x0", "cbc_x1",
+        prefix="cbc_sc",
     )
+    nodes += sn
+    inits += si
 
-    nodes.append(helper.make_node("Sub", inputs=["cbc_y1", "cbc_y0"], outputs=["cbc_h"]))
-    nodes.append(helper.make_node("Sub", inputs=["cbc_x1", "cbc_x0"], outputs=["cbc_w"]))
+    # One-hot color mask using Relu arithmetic (avoids Equal + Cast-from-bool)
+    # color_f[i] = Relu(1 - |color_ids_f[i] - selected_color_idx_f|) = 1 iff i==selected
     inits += [
-        _make_int64("cbc_canvas_i", [CANVAS]),
-        _make_int64("cbc_pad_prefix", [0, 0, 0, 0, 0, 0]),
-    ]
-    nodes.append(helper.make_node("Sub", inputs=["cbc_canvas_i", "cbc_h"], outputs=["cbc_bottom"]))
-    nodes.append(helper.make_node("Sub", inputs=["cbc_canvas_i", "cbc_w"], outputs=["cbc_right"]))
-    nodes.append(helper.make_node("Concat", inputs=["cbc_pad_prefix", "cbc_bottom", "cbc_right"], outputs=["cbc_pads"], axis=0))
-    nodes.append(helper.make_node("Pad", inputs=["cbc_crop", "cbc_pads"], outputs=["cbc_mask_padded"], mode="constant"))
-
-    inits += [
-        _make_int64("cbc_color_ids", list(range(C))),
+        _make_float("cbc_color_ids_f", list(range(C))),   # [0.0, 1.0, ..., 9.0]
+        _make_float("cbc_color_ones_f", [1.0]),             # scalar 1.0
         _make_int64("cbc_color_shape", [1, C, 1, 1]),
     ]
-    nodes.append(helper.make_node("Equal", inputs=["cbc_color_ids", "cbc_color_idx"], outputs=["cbc_color_b"]))
-    nodes.append(helper.make_node("Cast", inputs=["cbc_color_b"], outputs=["cbc_color_f"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Cast", inputs=["cbc_color_idx"], outputs=["cbc_color_idx_f"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Sub", inputs=["cbc_color_ids_f", "cbc_color_idx_f"], outputs=["cbc_color_diff"]))
+    nodes.append(helper.make_node("Abs", inputs=["cbc_color_diff"], outputs=["cbc_color_abs"]))
+    nodes.append(helper.make_node("Sub", inputs=["cbc_color_ones_f", "cbc_color_abs"], outputs=["cbc_color_hot_raw"]))
+    nodes.append(helper.make_node("Relu", inputs=["cbc_color_hot_raw"], outputs=["cbc_color_f"]))
     nodes.append(helper.make_node("Reshape", inputs=["cbc_color_f", "cbc_color_shape"], outputs=["cbc_color_mask"]))
     nodes.append(helper.make_node("Mul", inputs=["cbc_color_mask", "cbc_mask_padded"], outputs=["output"]))
 

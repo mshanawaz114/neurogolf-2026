@@ -6,7 +6,7 @@ from onnx import TensorProto, helper
 
 from solvers.base import BaseSolver
 from utils.arc_utils import detect_color_bbox_preserve_flip, grid_to_array
-from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, save
+from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, _t, save, static_crop_flip_shift_nodes
 
 
 def _color_bbox_preserve_flip_net(mode: str) -> onnx.ModelProto:
@@ -116,32 +116,79 @@ def _color_bbox_preserve_flip_net(mode: str) -> onnx.ModelProto:
     nodes.append(helper.make_node("Where", inputs=["cbpf_col_present_sel_b", "cbpf_ids_p1_2d", "cbpf_zeros_2d"], outputs=["cbpf_x1_candidates"]))
     reduce_max("cbpf_x1_candidates", "cbpf_x1", [1], keepdims=0)
 
-    inits += [
-        _make_int64("cbpf_row_axis", [2]),
-        _make_int64("cbpf_col_axis", [3]),
-        _make_int64("cbpf_step", [1]),
-    ]
-    nodes.append(helper.make_node("Slice", inputs=["input", "cbpf_y0", "cbpf_y1", "cbpf_row_axis", "cbpf_step"], outputs=["cbpf_rows"]))
-    nodes.append(helper.make_node("Slice", inputs=["cbpf_rows", "cbpf_x0", "cbpf_x1", "cbpf_col_axis", "cbpf_step"], outputs=["cbpf_crop"]))
+    # Static crop + horizontal flip + shift to top-left on ALL 10 channels.
+    # Reshape [1,C,30,30] -> [C,30,30], apply P_rows @ x @ P_flip_cols^T, reshape back.
+    # Uses Relu arithmetic (avoids Equal/Less/And/Not/Cast-from-bool).
+    import numpy as np
+    N = CANVAS
+    r_vec = np.arange(N, dtype=np.float32).reshape(N, 1)
+    j_vec = np.arange(N, dtype=np.float32).reshape(1, N)
+    j_minus_r_f = j_vec - r_vec           # [30,30] float
+    c_plus_k_f  = r_vec + j_vec           # [30,30] float
+    j_p1_f = np.arange(1, N + 1, dtype=np.float32).reshape(1, N)  # [1,30]
 
-    inits += [
-        _make_int64("cbpf_fs", [2**31 - 1]),
-        _make_int64("cbpf_fe", [-(2**31)]),
-        _make_int64("cbpf_fa", [3]),
-        _make_int64("cbpf_fst", [-1]),
-    ]
-    nodes.append(helper.make_node("Slice", inputs=["cbpf_crop", "cbpf_fs", "cbpf_fe", "cbpf_fa", "cbpf_fst"], outputs=["cbpf_flipped"]))
+    inits.append(_t("cbpf_jmr_f",  j_minus_r_f))
+    inits.append(_t("cbpf_cpk_f",  c_plus_k_f))
+    inits.append(_t("cbpf_jp1_f",  j_p1_f))
+    inits.append(_t("cbpf_jvec_f", j_vec))          # [1,30]: k values
+    inits.append(_t("cbpf_ones_f", np.ones((1, 1), dtype=np.float32)))
 
-    nodes.append(helper.make_node("Sub", inputs=["cbpf_y1", "cbpf_y0"], outputs=["cbpf_h"]))
-    nodes.append(helper.make_node("Sub", inputs=["cbpf_x1", "cbpf_x0"], outputs=["cbpf_w"]))
-    inits += [
-        _make_int64("cbpf_canvas_i", [CANVAS]),
-        _make_int64("cbpf_pad_prefix", [0, 0, 0, 0, 0, 0]),
-    ]
-    nodes.append(helper.make_node("Sub", inputs=["cbpf_canvas_i", "cbpf_h"], outputs=["cbpf_bottom"]))
-    nodes.append(helper.make_node("Sub", inputs=["cbpf_canvas_i", "cbpf_w"], outputs=["cbpf_right"]))
-    nodes.append(helper.make_node("Concat", inputs=["cbpf_pad_prefix", "cbpf_bottom", "cbpf_right"], outputs=["cbpf_pads"], axis=0))
-    nodes.append(helper.make_node("Pad", inputs=["cbpf_flipped", "cbpf_pads"], outputs=["output"], mode="constant"))
+    inits.append(_make_int64("cbpf_shape11", [1, 1]))
+    # Cast y0/y1/x0/x1 (int64 [1]) → float → [1,1]
+    for tag in ["y0", "y1", "x0", "x1"]:
+        nodes.append(helper.make_node("Cast",
+            inputs=[f"cbpf_{tag}"], outputs=[f"cbpf_{tag}_fflat"], to=TensorProto.FLOAT))
+        nodes.append(helper.make_node("Reshape",
+            inputs=[f"cbpf_{tag}_fflat", "cbpf_shape11"], outputs=[f"cbpf_{tag}_f"]))
+
+    # x1 - 1.0 for flip column formula
+    nodes.append(helper.make_node("Sub",
+        inputs=["cbpf_x1_f", "cbpf_ones_f"], outputs=["cbpf_x1m1_f"]))
+
+    # P_rows: Relu(1 - |jmr_f - y0_f|) * Relu(1 - Relu(j+1 - y1_f))
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_jmr_f", "cbpf_y0_f"], outputs=["cbpf_diff_r"]))
+    nodes.append(helper.make_node("Abs", inputs=["cbpf_diff_r"], outputs=["cbpf_abs_r"]))
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_ones_f", "cbpf_abs_r"], outputs=["cbpf_pr_pre"]))
+    nodes.append(helper.make_node("Relu", inputs=["cbpf_pr_pre"], outputs=["cbpf_Pr_ind"]))
+
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_jp1_f", "cbpf_y1_f"], outputs=["cbpf_jp1_m_y1"]))
+    nodes.append(helper.make_node("Relu", inputs=["cbpf_jp1_m_y1"], outputs=["cbpf_relu_jp1_m_y1"]))
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_ones_f", "cbpf_relu_jp1_m_y1"], outputs=["cbpf_lt_y1_raw"]))
+    nodes.append(helper.make_node("Relu", inputs=["cbpf_lt_y1_raw"], outputs=["cbpf_lt_y1"]))
+    nodes.append(helper.make_node("Mul", inputs=["cbpf_Pr_ind", "cbpf_lt_y1"], outputs=["cbpf_Pr"]))
+
+    # P_flip_cols: Relu(1 - |cpk_f - x1m1_f|) * Relu(1-Relu(x0_f-jvec_f)) * Relu(1-Relu(j+1-x1_f))
+    # (c+k == x1-1) indicator
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_cpk_f", "cbpf_x1m1_f"], outputs=["cbpf_diff_ck"]))
+    nodes.append(helper.make_node("Abs", inputs=["cbpf_diff_ck"], outputs=["cbpf_abs_ck"]))
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_ones_f", "cbpf_abs_ck"], outputs=["cbpf_eq_ck_raw"]))
+    nodes.append(helper.make_node("Relu", inputs=["cbpf_eq_ck_raw"], outputs=["cbpf_eq_ck"]))  # [30,30]
+
+    # k >= x0: Relu(1 - Relu(x0_f - jvec_f))
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_x0_f", "cbpf_jvec_f"], outputs=["cbpf_x0_m_k"]))
+    nodes.append(helper.make_node("Relu", inputs=["cbpf_x0_m_k"], outputs=["cbpf_relu_x0_m_k"]))
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_ones_f", "cbpf_relu_x0_m_k"], outputs=["cbpf_ge_x0_raw"]))
+    nodes.append(helper.make_node("Relu", inputs=["cbpf_ge_x0_raw"], outputs=["cbpf_ge_x0"]))  # [1,30]
+
+    # k < x1: Relu(1 - Relu(j+1 - x1_f))
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_jp1_f", "cbpf_x1_f"], outputs=["cbpf_jp1_m_x1"]))
+    nodes.append(helper.make_node("Relu", inputs=["cbpf_jp1_m_x1"], outputs=["cbpf_relu_jp1_m_x1"]))
+    nodes.append(helper.make_node("Sub", inputs=["cbpf_ones_f", "cbpf_relu_jp1_m_x1"], outputs=["cbpf_lt_x1_raw"]))
+    nodes.append(helper.make_node("Relu", inputs=["cbpf_lt_x1_raw"], outputs=["cbpf_lt_x1"]))  # [1,30]
+
+    # Combine
+    nodes.append(helper.make_node("Mul", inputs=["cbpf_ge_x0", "cbpf_lt_x1"], outputs=["cbpf_k_range"]))
+    nodes.append(helper.make_node("Mul", inputs=["cbpf_eq_ck", "cbpf_k_range"], outputs=["cbpf_Pfc"]))
+    nodes.append(helper.make_node("Transpose", inputs=["cbpf_Pfc"], outputs=["cbpf_Pfc_T"], perm=[1, 0]))
+
+    # Reshape input [1,C,30,30] -> [C,30,30]
+    inits.append(_make_int64("cbpf_shC2", [C, N, N]))
+    nodes.append(helper.make_node("Reshape", inputs=["input", "cbpf_shC2"], outputs=["cbpf_inp_2d"]))
+    nodes.append(helper.make_node("MatMul", inputs=["cbpf_Pr", "cbpf_inp_2d"], outputs=["cbpf_rows_sh"]))
+    nodes.append(helper.make_node("MatMul", inputs=["cbpf_rows_sh", "cbpf_Pfc_T"], outputs=["cbpf_shifted"]))
+
+    inits.append(_make_int64("cbpf_sh_out", [1, C, N, N]))
+    nodes.append(helper.make_node("Reshape", inputs=["cbpf_shifted", "cbpf_sh_out"], outputs=["output"]))
 
     graph = helper.make_graph(
         nodes,

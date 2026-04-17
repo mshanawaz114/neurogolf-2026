@@ -1,7 +1,7 @@
 PYTHON := python3
 PIP    := pip3
 
-.PHONY: install venv data lint format test validate score view build-all zip clean
+.PHONY: install venv data lint format test validate score view build-all zip safe-zip clean
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 venv:
@@ -64,6 +64,16 @@ zip:
 	@echo "Packaging submission.zip..."
 	cd onnx && zip ../submission.zip task*.onnx
 	@echo "Done: submission.zip"
+
+safe-zip:
+	@echo "Building submission_full_safe.zip..."
+	$(PYTHON) scripts/build_safe_submission.py
+	@echo "Done: submission_full_safe.zip"
+
+static23-zip:
+	@echo "Building submission_full_safe.zip with the static23 profile..."
+	$(PYTHON) scripts/build_safe_submission.py --profile static23
+	@echo "Done: submission_full_safe.zip"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:

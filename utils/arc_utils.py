@@ -13,6 +13,7 @@ import json
 import numpy as np
 from pathlib import Path
 from typing import Any
+from collections import deque
 
 CANVAS = 30   # Fixed canvas size
 C = 10        # Number of colour channels
@@ -378,6 +379,234 @@ def detect_color_bbox_preserve_flip(inp: np.ndarray, out: np.ndarray, mode: str)
     return np.array_equal(np.fliplr(inp[y0:y1, x0:x1]), out)
 
 
+def detect_self_kron_mask(inp: np.ndarray, out: np.ndarray) -> bool:
+    """
+    Detect output = kron(inp != 0, inp), i.e. tile the whole input into blocks
+    selected by the input's own non-zero mask.
+    """
+    mask = (inp != 0).astype(inp.dtype)
+    pred = np.kron(mask, inp)
+    return pred.shape == out.shape and np.array_equal(pred, out)
+
+
+def _fill_holes(mask: np.ndarray) -> np.ndarray:
+    """
+    Fill holes in a binary object using 4-connected background flood-fill.
+    This matches scipy.ndimage.binary_fill_holes(..., structure=cross).
+    """
+    h, w = mask.shape
+    open_cells = ~mask
+    reachable = np.zeros_like(mask, dtype=bool)
+    q: deque[tuple[int, int]] = deque()
+
+    for r in range(h):
+        for c in (0, w - 1):
+            if open_cells[r, c] and not reachable[r, c]:
+                reachable[r, c] = True
+                q.append((r, c))
+    for c in range(w):
+        for r in (0, h - 1):
+            if open_cells[r, c] and not reachable[r, c]:
+                reachable[r, c] = True
+                q.append((r, c))
+
+    while q:
+        r, c = q.popleft()
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            rr, cc = r + dr, c + dc
+            if 0 <= rr < h and 0 <= cc < w and open_cells[rr, cc] and not reachable[rr, cc]:
+                reachable[rr, cc] = True
+                q.append((rr, cc))
+
+    return open_cells & ~reachable
+
+
+def detect_color_hole_fill(inp: np.ndarray, out: np.ndarray) -> tuple[int, int] | None:
+    """
+    Detect tasks that preserve a single non-zero boundary colour and fill the
+    holes it encloses with a new colour.
+    """
+    if inp.shape != out.shape:
+        return None
+
+    boundary_colors = [int(v) for v in np.unique(inp) if int(v) != 0]
+    if len(boundary_colors) != 1:
+        return None
+    boundary = boundary_colors[0]
+
+    changed = inp != out
+    if np.any(inp[changed] != 0):
+        return None
+    fill_colors = [int(v) for v in np.unique(out[changed])]
+    if len(fill_colors) != 1 or fill_colors[0] == 0:
+        return None
+    fill = fill_colors[0]
+
+    pred = inp.copy()
+    pred[_fill_holes(inp == boundary)] = fill
+    if np.array_equal(pred, out):
+        return boundary, fill
+    return None
+
+
+def detect_corner_rectangle_fill(inp: np.ndarray, out: np.ndarray) -> tuple[int, int, tuple[tuple[int, int], ...]] | None:
+    """
+    Detect tasks where a single non-zero color marks the four corners of one or
+    more axis-aligned rectangles, and the output fills each rectangle interior
+    with a single new color.
+    """
+    if inp.shape != out.shape:
+        return None
+
+    boundary_colors = [int(v) for v in np.unique(inp) if int(v) != 0]
+    if len(boundary_colors) != 1:
+        return None
+    boundary = boundary_colors[0]
+
+    changed = inp != out
+    if np.any(inp[changed] != 0):
+        return None
+    fill_colors = [int(v) for v in np.unique(out[changed])]
+    if len(fill_colors) != 1 or fill_colors[0] == 0:
+        return None
+    fill = fill_colors[0]
+
+    pts = set(map(tuple, np.argwhere(inp == boundary).tolist()))
+    mask = np.zeros_like(inp, dtype=bool)
+    sizes: set[tuple[int, int]] = set()
+    for r1, c1 in pts:
+        for r2, c2 in pts:
+            if r2 <= r1 + 1 or c2 <= c1 + 1:
+                continue
+            if {(r1, c1), (r1, c2), (r2, c1), (r2, c2)}.issubset(pts):
+                mask[r1 + 1 : r2, c1 + 1 : c2] = True
+                sizes.add((r2 - r1, c2 - c1))
+
+    if not sizes or not np.array_equal(mask, changed):
+        return None
+
+    pred = inp.copy()
+    pred[mask] = fill
+    if np.array_equal(pred, out):
+        return boundary, fill, tuple(sorted(sizes))
+    return None
+
+
+def detect_horizontal_gap_fill(inp: np.ndarray, out: np.ndarray) -> tuple[int, int] | None:
+    """
+    Detect tasks where a single colour gains fill pixels exactly in one-cell
+    horizontal gaps between two same-colour pixels on the same row.
+    """
+    if inp.shape != out.shape:
+        return None
+
+    boundary_colors = [int(v) for v in np.unique(inp) if int(v) != 0]
+    if len(boundary_colors) != 1:
+        return None
+    boundary = boundary_colors[0]
+
+    changed = inp != out
+    if np.any(inp[changed] != 0):
+        return None
+    fill_colors = [int(v) for v in np.unique(out[changed])]
+    if len(fill_colors) != 1 or fill_colors[0] == 0:
+        return None
+    fill = fill_colors[0]
+
+    mask = inp == boundary
+    pred_mask = np.zeros_like(mask, dtype=bool)
+    for r in range(mask.shape[0]):
+        cols = np.where(mask[r])[0]
+        colset = set(cols.tolist())
+        for c in cols:
+            if c + 2 in colset and c + 1 not in colset:
+                pred_mask[r, c + 1] = True
+
+    if not np.array_equal(pred_mask, changed):
+        return None
+
+    pred = inp.copy()
+    pred[pred_mask] = fill
+    if np.array_equal(pred, out):
+        return boundary, fill
+    return None
+
+
+def detect_l_corner_fill(inp: np.ndarray, out: np.ndarray) -> tuple[int, int] | None:
+    """
+    Detect tasks where a single colour forms 3 cells of a 2x2 block and the
+    output fills the missing corner with a new colour.
+    """
+    if inp.shape != out.shape:
+        return None
+
+    boundary_colors = [int(v) for v in np.unique(inp) if int(v) != 0]
+    if len(boundary_colors) != 1:
+        return None
+    boundary = boundary_colors[0]
+
+    changed = inp != out
+    if np.any(inp[changed] != 0):
+        return None
+    fill_colors = [int(v) for v in np.unique(out[changed])]
+    if len(fill_colors) != 1 or fill_colors[0] == 0:
+        return None
+    fill = fill_colors[0]
+
+    mask = inp == boundary
+    pred_mask = np.zeros_like(mask, dtype=bool)
+    for r in range(mask.shape[0] - 1):
+        for c in range(mask.shape[1] - 1):
+            sub = mask[r : r + 2, c : c + 2]
+            if sub.sum() == 3:
+                miss = np.argwhere(~sub)
+                if len(miss) == 1:
+                    rr, cc = miss[0]
+                    pred_mask[r + rr, c + cc] = True
+
+    if not np.array_equal(pred_mask, changed):
+        return None
+
+    pred = inp.copy()
+    pred[pred_mask] = fill
+    if np.array_equal(pred, out):
+        return boundary, fill
+    return None
+
+
+def detect_bounce_seed(inp: np.ndarray, out: np.ndarray) -> tuple[int, int, int, int] | None:
+    """
+    Detect a single non-zero seed at bottom-left expanding into a triangular-wave
+    path up the grid.
+    Returns (seed_color, height, width, period).
+    """
+    if inp.shape != out.shape:
+        return None
+    h, w = inp.shape
+    nz = np.argwhere(inp != 0)
+    if len(nz) != 1:
+        return None
+    r0, c0 = map(int, nz[0])
+    seed = int(inp[r0, c0])
+    if (r0, c0) != (h - 1, 0):
+        return None
+
+    pred = np.zeros_like(inp)
+    period = max(1, 2 * (w - 1))
+    for r in range(h):
+        t = (h - 1) - r
+        if w == 1:
+            c = 0
+        else:
+            m = t % period
+            c = m if m <= w - 1 else period - m
+        pred[r, c] = seed
+
+    if np.array_equal(pred, out):
+        return seed, h, w, period
+    return None
+
+
 def detect_spatial_color_transform(
     inp: np.ndarray, out: np.ndarray
 ) -> tuple[str, dict[int, int]] | None:
@@ -569,6 +798,76 @@ def analyse_task(task: dict) -> dict[str, Any]:
     if min_bbox_preserve_flip ^ max_bbox_preserve_flip:
         color_bbox_preserve_flip_mode = "min_bbox" if min_bbox_preserve_flip else "max_bbox"
 
+    # --- Self-mask Kronecker tiling ---
+    self_kron_mask = all(detect_self_kron_mask(i, o) for i, o in detect_pairs)
+
+    # --- Fill holes in a single-colour boundary mask ---
+    hole_fills = [detect_color_hole_fill(i, o) for i, o in detect_pairs]
+    is_hole_fill = all(hf is not None for hf in hole_fills)
+    hole_fill_boundary = None
+    hole_fill_color = None
+    if is_hole_fill:
+        ref_boundary, ref_fill = hole_fills[0]
+        is_hole_fill = all(hf == (ref_boundary, ref_fill) for hf in hole_fills[1:])
+        if is_hole_fill:
+            hole_fill_boundary = ref_boundary
+            hole_fill_color = ref_fill
+
+    # --- Fill rectangle interiors implied by same-color corner markers ---
+    corner_rects = [detect_corner_rectangle_fill(i, o) for i, o in detect_pairs]
+    is_corner_rect_fill = all(cr is not None for cr in corner_rects)
+    corner_rect_boundary = None
+    corner_rect_fill = None
+    corner_rect_sizes = None
+    if is_corner_rect_fill:
+        ref_boundary, ref_fill, ref_sizes = corner_rects[0]
+        is_corner_rect_fill = all((cr[0], cr[1]) == (ref_boundary, ref_fill) for cr in corner_rects[1:])
+        if is_corner_rect_fill:
+            corner_rect_boundary = ref_boundary
+            corner_rect_fill = ref_fill
+            size_set = set(ref_sizes)
+            for cr in corner_rects[1:]:
+                size_set.update(cr[2])
+            corner_rect_sizes = tuple(sorted(size_set))
+
+    # --- Fill horizontal one-cell gaps between matching pixels ---
+    hgap_fills = [detect_horizontal_gap_fill(i, o) for i, o in detect_pairs]
+    is_hgap_fill = all(hg is not None for hg in hgap_fills)
+    hgap_boundary = None
+    hgap_fill = None
+    if is_hgap_fill:
+        ref_boundary, ref_fill = hgap_fills[0]
+        is_hgap_fill = all(hg == (ref_boundary, ref_fill) for hg in hgap_fills[1:])
+        if is_hgap_fill:
+            hgap_boundary = ref_boundary
+            hgap_fill = ref_fill
+
+    # --- Complete missing corners of 2x2 L-shapes ---
+    lcorner_fills = [detect_l_corner_fill(i, o) for i, o in detect_pairs]
+    is_lcorner_fill = all(lc is not None for lc in lcorner_fills)
+    lcorner_boundary = None
+    lcorner_fill = None
+    if is_lcorner_fill:
+        ref_boundary, ref_fill = lcorner_fills[0]
+        is_lcorner_fill = all(lc == (ref_boundary, ref_fill) for lc in lcorner_fills[1:])
+        if is_lcorner_fill:
+            lcorner_boundary = ref_boundary
+            lcorner_fill = ref_fill
+
+    # --- Single seed expands into a bounce / triangular-wave path ---
+    bounce_seeds = [detect_bounce_seed(i, o) for i, o in detect_pairs]
+    is_bounce_seed = all(bs is not None for bs in bounce_seeds)
+    bounce_seed_color = None
+    bounce_height = None
+    bounce_widths = None
+    if is_bounce_seed:
+        ref_color, ref_h, _, _ = bounce_seeds[0]
+        is_bounce_seed = all(bs[0] == ref_color and bs[1] == ref_h for bs in bounce_seeds[1:])
+        if is_bounce_seed:
+            bounce_seed_color = ref_color
+            bounce_height = ref_h
+            bounce_widths = tuple(sorted({bs[2] for bs in bounce_seeds}))
+
     # --- Size info (train pairs only, for building fixed-size networks) ---
     train_in_shapes  = list({i.shape for i, o in detect_pairs})
     train_out_shapes = list({o.shape for i, o in detect_pairs})
@@ -598,6 +897,24 @@ def analyse_task(task: dict) -> dict[str, Any]:
         "color_count_preserve_crop_mode": color_count_preserve_crop_mode,
         "color_bbox_preserve_flip": color_bbox_preserve_flip_mode is not None,
         "color_bbox_preserve_flip_mode": color_bbox_preserve_flip_mode,
+        "self_kron_mask":       self_kron_mask,
+        "color_hole_fill":      is_hole_fill,
+        "color_hole_fill_boundary": hole_fill_boundary,
+        "color_hole_fill_fill": hole_fill_color,
+        "corner_rect_fill":     is_corner_rect_fill,
+        "corner_rect_boundary": corner_rect_boundary,
+        "corner_rect_fill_color": corner_rect_fill,
+        "corner_rect_sizes":    corner_rect_sizes,
+        "horizontal_gap_fill":  is_hgap_fill,
+        "horizontal_gap_boundary": hgap_boundary,
+        "horizontal_gap_fill_color": hgap_fill,
+        "lcorner_fill":         is_lcorner_fill,
+        "lcorner_boundary":     lcorner_boundary,
+        "lcorner_fill_color":   lcorner_fill,
+        "bounce_seed":          is_bounce_seed,
+        "bounce_seed_color":    bounce_seed_color,
+        "bounce_height":        bounce_height,
+        "bounce_widths":        bounce_widths,
         "spatial_color":        is_spatial_color,
         "spatial_color_transform": spatial_color_transform,
         "spatial_color_mapping": spatial_color_mapping,
