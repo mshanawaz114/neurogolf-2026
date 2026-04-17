@@ -168,6 +168,44 @@ Handles zero-filled translations on same-sized grids.
 Uses `Slice` + `Pad` analytically — **zero MACs**.
 Score per task: ~**21+**
 
+### Priority 14 — `ColorCountCropSolver`
+Handles tasks where the output is the bounding-box crop of the selected non-zero colour:
+- `min`: least frequent non-zero colour
+- `max`: most frequent non-zero colour
+
+Uses runtime count selection (`ArgMin`/`ArgMax`), dynamic `Gather`, and dynamic
+`Slice` + `Pad` to place the cropped shape in the top-left output region.
+Score per task: usually **19–21+**
+
+### Priority 14 — `ColorBBoxCropSolver`
+Handles tasks where the output is the bounding-box crop of the selected non-zero colour:
+- `min_bbox`: smallest overall colour bounding box
+- `max_bbox`: largest overall colour bounding box
+
+Uses runtime bbox-area selection over colour channels, then dynamic `Gather`
+and dynamic `Slice` + `Pad` to place the cropped mask in the top-left output region.
+Score per task: usually **19–21+**
+
+### Priority 14 — `ColorBBoxPreserveFlipSolver`
+Handles tasks where the output is the horizontally flipped bounding-box crop of the
+selected non-zero colour's full subgrid:
+- `min_bbox`: smallest overall colour bounding box
+- `max_bbox`: largest overall colour bounding box
+
+Uses runtime bbox-area selection, dynamic bbox extraction from the selected colour,
+then a horizontal `Slice`-flip before top-left padding.
+Score per task: usually **20–21+**
+
+### Priority 14 — `ColorCountPreserveCropSolver`
+Handles tasks where the output is the bounding-box crop of the selected non-zero colour,
+but preserves every colour inside that cropped rectangle:
+- `min`: least frequent non-zero colour
+- `max`: most frequent non-zero colour
+
+Uses runtime count selection, dynamic bbox extraction from the selected colour,
+and dynamic `Slice` + `Pad` on the original full tensor.
+Score per task: usually **20–21+**
+
 ### Priority 13 — `UpscaleSolver`
 Handles integer nearest-neighbour upscaling such as 2x2 or 3x3 expansion.
 Uses ONNX `Resize` plus fixed crop/pad.
@@ -177,6 +215,20 @@ Score per task: ~**20+**
 Handles tasks where the output is the bounding-box crop of all non-background pixels.
 Uses multi-candidate analytical crop selection across observed splits.
 Score per task: usually **18–20+** depending on selector graph size.
+
+### Priority 14 — `FixedCropSolver`
+Handles tasks where the output is a fixed rectangular crop of the input.
+Uses `Slice` + `Pad` analytically after reconfirming the same rectangle across all splits.
+Score per task: usually **21+**
+
+### Priority 15 — `GravitySolver`
+Handles column-wise gravity for background colour `0`:
+- `gravity_down`: compact non-zero cells to the bottom of each column
+- `gravity_up`: compact non-zero cells to the top of each column
+
+Uses `CumSum` to compute per-column ranks, then analytical row-placement masks
+to move each source cell into its target row.
+Score per task: usually **19–20+**
 
 ### Priority 90 — `LearnedSolver`
 Fallback: trains a PyTorch or NumPy conv net over a staged architecture search.
@@ -188,10 +240,12 @@ Score per task: ~**8–13** depending on architecture needed.
 
 The current deterministic stack validates exactly on:
 
-`task031`, `task053`, `task087`, `task140`, `task150`, `task155`,
-`task179`, `task223`, `task241`, `task276`, `task307`, `task309`
+`task014`, `task031`, `task032`, `task036`, `task049`, `task053`,
+`task078`, `task087`, `task135`, `task140`, `task150`, `task155`,
+`task177`, `task179`, `task223`, `task241`, `task276`, `task300`,
+`task307`, `task309`, `task310`, `task326`
 
-Current exact solved count: **12**
+Current exact solved count: **22**
 
 This is still far from leaderboard-contending coverage, but it is the current
 stable analytical base.
@@ -219,9 +273,14 @@ neurogolf-2026/
 │   ├── color_perm.py         ← ColorPermSolver (1×1 conv)
 │   ├── tiling.py             ← TilingSolver
 │   ├── translate.py          ← TranslateSolver
+│   ├── color_bbox_crop.py    ← ColorBBoxCropSolver
+│   ├── color_bbox_preserve_flip.py ← ColorBBoxPreserveFlipSolver
+│   ├── color_count_crop.py   ← ColorCountCropSolver
+│   ├── color_count_preserve_crop.py ← ColorCountPreserveCropSolver
 │   ├── upscale.py            ← UpscaleSolver
+│   ├── fixed_crop.py         ← FixedCropSolver
 │   ├── trim_bbox.py          ← TrimBBoxSolver
-│   ├── gravity.py            ← GravitySolver stub
+│   ├── gravity.py            ← GravitySolver
 │   └── learned.py            ← LearnedSolver (PyTorch training fallback)
 │
 ├── utils/

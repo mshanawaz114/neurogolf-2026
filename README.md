@@ -144,19 +144,26 @@ See [agent.md](agent.md) for the full technical specification.
 | `TilingSolver` | 8 | Concat + Pad (zero MACs) | ~21+ |
 | `ColorPermSolver` | 10 | 1×1 Conv with 10×10 weight matrix | ~13.6 |
 | `TranslateSolver` | 12 | Slice + Pad translation (zero MACs) | ~21+ |
+| `ColorBBoxCropSolver` | 14 | Select non-zero colour by bbox size and crop its mask | ~19-21 |
+| `ColorBBoxPreserveFlipSolver` | 14 | Select non-zero colour by bbox size, crop its subgrid, then flip | ~20-21 |
+| `ColorCountCropSolver` | 14 | Select min/max-frequency non-zero colour and crop its bbox | ~19-21 |
+| `ColorCountPreserveCropSolver` | 14 | Select min/max-frequency non-zero colour and crop its full subgrid | ~20-21 |
 | `UpscaleSolver` | 13 | Nearest-neighbour resize + crop | ~20+ |
+| `FixedCropSolver` | 14 | Fixed rectangular submatrix crop | ~21+ |
 | `TrimBBoxSolver` | 14 | Crop to bounding box of non-background pixels | ~18-20 |
-| `GravitySolver` | 15 | Stub — falls through to LearnedSolver | — |
+| `GravitySolver` | 15 | Column-wise gravity via `CumSum` + row placement masks | ~19-20 |
 | `LearnedSolver` | 90 | Adam-trained conv search with larger late-stage models | ~8–13 |
 
 ### Current Exact Coverage
 
 As of the current repo state, the deterministic stack validates exactly on:
 
-`task031`, `task053`, `task087`, `task140`, `task150`, `task155`,
-`task179`, `task223`, `task241`, `task276`, `task307`, `task309`
+`task014`, `task031`, `task032`, `task036`, `task049`, `task053`,
+`task078`, `task087`, `task135`, `task140`, `task150`, `task155`,
+`task177`, `task179`, `task223`, `task241`, `task276`, `task300`,
+`task307`, `task309`, `task310`, `task326`
 
-That is `12` exact solves before counting any learned-fallback wins.
+That is `22` exact solves before counting any learned-fallback wins.
 
 ### What To Detect First
 

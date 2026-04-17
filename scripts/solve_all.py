@@ -33,6 +33,11 @@ from solvers.spatial_color import SpatialColorSolver
 from solvers.color_perm import ColorPermSolver
 from solvers.tiling     import TilingSolver
 from solvers.translate  import TranslateSolver
+from solvers.color_bbox_crop import ColorBBoxCropSolver
+from solvers.color_bbox_preserve_flip import ColorBBoxPreserveFlipSolver
+from solvers.color_count_crop import ColorCountCropSolver
+from solvers.color_count_preserve_crop import ColorCountPreserveCropSolver
+from solvers.fixed_crop import FixedCropSolver
 from solvers.trim_bbox  import TrimBBoxSolver
 from solvers.upscale    import UpscaleSolver
 from solvers.gravity    import GravitySolver
@@ -45,6 +50,11 @@ ALL_SOLVERS = [
     ColorPermSolver(),
     TilingSolver(),
     TranslateSolver(),
+    ColorBBoxCropSolver(),
+    ColorBBoxPreserveFlipSolver(),
+    ColorCountCropSolver(),
+    ColorCountPreserveCropSolver(),
+    FixedCropSolver(),
     TrimBBoxSolver(),
     UpscaleSolver(),
     GravitySolver(),

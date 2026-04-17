@@ -235,6 +235,149 @@ def detect_trim_bbox(inp: np.ndarray, out: np.ndarray) -> tuple[int, int, int, i
     return None
 
 
+def detect_fixed_submatrix(inp: np.ndarray, out: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Detect whether output is a fixed rectangular crop of the input."""
+    in_h, in_w = inp.shape
+    out_h, out_w = out.shape
+    if out_h > in_h or out_w > in_w:
+        return None
+    for y0 in range(in_h - out_h + 1):
+        for x0 in range(in_w - out_w + 1):
+            y1 = y0 + out_h
+            x1 = x0 + out_w
+            if np.array_equal(inp[y0:y1, x0:x1], out):
+                return y0, y1, x0, x1
+    return None
+
+
+def detect_color_count_crop(inp: np.ndarray, out: np.ndarray, mode: str) -> bool:
+    """
+    Detect crop-to-bbox of a selected non-zero colour, preserving only that colour.
+    mode:
+      - "max": select the most frequent non-zero colour
+      - "min": select the least frequent non-zero colour
+    """
+    vals, cnts = np.unique(inp[inp != 0], return_counts=True)
+    if len(vals) == 0:
+        return False
+
+    counts = [(int(v), int(c)) for v, c in zip(vals.tolist(), cnts.tolist())]
+    if mode == "max":
+        color = max(counts, key=lambda kv: (kv[1], -kv[0]))[0]
+    elif mode == "min":
+        color = min(counts, key=lambda kv: (kv[1], kv[0]))[0]
+    else:
+        raise ValueError(f"unknown color-count mode: {mode}")
+
+    ys, xs = np.where(inp == color)
+    if len(ys) == 0:
+        return False
+    y0, y1 = ys.min(), ys.max() + 1
+    x0, x1 = xs.min(), xs.max() + 1
+
+    crop = np.zeros((y1 - y0, x1 - x0), dtype=inp.dtype)
+    sub = inp[y0:y1, x0:x1]
+    crop[sub == color] = color
+    return np.array_equal(crop, out)
+
+
+def detect_color_bbox_crop(inp: np.ndarray, out: np.ndarray, mode: str) -> bool:
+    """
+    Detect crop-to-bbox of the selected non-zero colour, where selection is based
+    on the colour's overall bounding-box area in the input.
+    mode:
+      - "min_bbox": smallest bbox area, then smallest colour on ties
+      - "max_bbox": largest bbox area, then smallest colour on ties
+    """
+    colors = [int(v) for v in np.unique(inp) if int(v) != 0]
+    if not colors:
+        return False
+
+    items = []
+    for color in colors:
+        ys, xs = np.where(inp == color)
+        if len(ys) == 0:
+            continue
+        y0, y1 = ys.min(), ys.max() + 1
+        x0, x1 = xs.min(), xs.max() + 1
+        items.append((color, (y1 - y0) * (x1 - x0), y0, y1, x0, x1))
+    if not items:
+        return False
+
+    if mode == "min_bbox":
+        color, _, y0, y1, x0, x1 = min(items, key=lambda t: (t[1], t[0]))
+    elif mode == "max_bbox":
+        color, _, y0, y1, x0, x1 = max(items, key=lambda t: (t[1], -t[0]))
+    else:
+        raise ValueError(f"unknown color-bbox mode: {mode}")
+
+    crop = np.zeros((y1 - y0, x1 - x0), dtype=inp.dtype)
+    sub = inp[y0:y1, x0:x1]
+    crop[sub == color] = color
+    return np.array_equal(crop, out)
+
+
+def detect_color_count_preserve_crop(inp: np.ndarray, out: np.ndarray, mode: str) -> bool:
+    """
+    Detect crop of the bounding box of a selected non-zero colour while preserving
+    all colours inside that rectangle.
+    mode:
+      - "min": select the least frequent non-zero colour
+      - "max": select the most frequent non-zero colour
+    """
+    vals, cnts = np.unique(inp[inp != 0], return_counts=True)
+    if len(vals) == 0:
+        return False
+
+    counts = [(int(v), int(c)) for v, c in zip(vals.tolist(), cnts.tolist())]
+    if mode == "min":
+        color = min(counts, key=lambda kv: (kv[1], kv[0]))[0]
+    elif mode == "max":
+        color = max(counts, key=lambda kv: (kv[1], -kv[0]))[0]
+    else:
+        raise ValueError(f"unknown color-count preserve mode: {mode}")
+
+    ys, xs = np.where(inp == color)
+    if len(ys) == 0:
+        return False
+    y0, y1 = ys.min(), ys.max() + 1
+    x0, x1 = xs.min(), xs.max() + 1
+    return np.array_equal(inp[y0:y1, x0:x1], out)
+
+
+def detect_color_bbox_preserve_flip(inp: np.ndarray, out: np.ndarray, mode: str) -> bool:
+    """
+    Detect crop of the bounding box of a selected non-zero colour while preserving
+    all colours inside that rectangle, followed by a horizontal flip.
+    mode:
+      - "min_bbox": select the smallest overall colour bounding box
+      - "max_bbox": select the largest overall colour bounding box
+    """
+    colors = [int(v) for v in np.unique(inp) if int(v) != 0]
+    if not colors:
+        return False
+
+    items = []
+    for color in colors:
+        ys, xs = np.where(inp == color)
+        if len(ys) == 0:
+            continue
+        y0, y1 = ys.min(), ys.max() + 1
+        x0, x1 = xs.min(), xs.max() + 1
+        items.append((color, (y1 - y0) * (x1 - x0), y0, y1, x0, x1))
+    if not items:
+        return False
+
+    if mode == "min_bbox":
+        _, _, y0, y1, x0, x1 = min(items, key=lambda t: (t[1], t[0]))
+    elif mode == "max_bbox":
+        _, _, y0, y1, x0, x1 = max(items, key=lambda t: (t[1], -t[0]))
+    else:
+        raise ValueError(f"unknown color-bbox preserve-flip mode: {mode}")
+
+    return np.array_equal(np.fliplr(inp[y0:y1, x0:x1]), out)
+
+
 def detect_spatial_color_transform(
     inp: np.ndarray, out: np.ndarray
 ) -> tuple[str, dict[int, int]] | None:
@@ -389,6 +532,43 @@ def analyse_task(task: dict) -> dict[str, Any]:
             trim_bbox_bg = ref_bg
             trim_bbox_candidates = sorted({tb[1:] for tb in trim_bboxes})
 
+    # --- Fixed submatrix crop (from train only) ---
+    fixed_submatrices = [detect_fixed_submatrix(i, o) for i, o in detect_pairs]
+    is_fixed_submatrix = all(fs is not None for fs in fixed_submatrices)
+    fixed_submatrix = None
+    if is_fixed_submatrix:
+        ref = fixed_submatrices[0]
+        is_fixed_submatrix = all(fs == ref for fs in fixed_submatrices[1:])
+        fixed_submatrix = ref if is_fixed_submatrix else None
+
+    # --- Crop bbox of selected colour by count rule (from train only) ---
+    min_count_color_crop = all(detect_color_count_crop(i, o, "min") for i, o in detect_pairs)
+    max_count_color_crop = all(detect_color_count_crop(i, o, "max") for i, o in detect_pairs)
+    color_count_crop_mode = None
+    if min_count_color_crop ^ max_count_color_crop:
+        color_count_crop_mode = "min" if min_count_color_crop else "max"
+
+    # --- Crop bbox of selected colour by bbox-area rule (from train only) ---
+    min_bbox_color_crop = all(detect_color_bbox_crop(i, o, "min_bbox") for i, o in detect_pairs)
+    max_bbox_color_crop = all(detect_color_bbox_crop(i, o, "max_bbox") for i, o in detect_pairs)
+    color_bbox_crop_mode = None
+    if min_bbox_color_crop ^ max_bbox_color_crop:
+        color_bbox_crop_mode = "min_bbox" if min_bbox_color_crop else "max_bbox"
+
+    # --- Crop bbox of selected colour by count rule, preserving full subgrid ---
+    min_count_preserve_crop = all(detect_color_count_preserve_crop(i, o, "min") for i, o in detect_pairs)
+    max_count_preserve_crop = all(detect_color_count_preserve_crop(i, o, "max") for i, o in detect_pairs)
+    color_count_preserve_crop_mode = None
+    if min_count_preserve_crop ^ max_count_preserve_crop:
+        color_count_preserve_crop_mode = "min" if min_count_preserve_crop else "max"
+
+    # --- Crop bbox of selected colour by bbox rule, preserve subgrid, then flip_h ---
+    min_bbox_preserve_flip = all(detect_color_bbox_preserve_flip(i, o, "min_bbox") for i, o in detect_pairs)
+    max_bbox_preserve_flip = all(detect_color_bbox_preserve_flip(i, o, "max_bbox") for i, o in detect_pairs)
+    color_bbox_preserve_flip_mode = None
+    if min_bbox_preserve_flip ^ max_bbox_preserve_flip:
+        color_bbox_preserve_flip_mode = "min_bbox" if min_bbox_preserve_flip else "max_bbox"
+
     # --- Size info (train pairs only, for building fixed-size networks) ---
     train_in_shapes  = list({i.shape for i, o in detect_pairs})
     train_out_shapes = list({o.shape for i, o in detect_pairs})
@@ -408,6 +588,16 @@ def analyse_task(task: dict) -> dict[str, Any]:
         "trim_bbox":            is_trim_bbox,
         "trim_bbox_bg":         trim_bbox_bg,
         "trim_bbox_candidates": trim_bbox_candidates,
+        "fixed_submatrix":      is_fixed_submatrix,
+        "fixed_submatrix_rect": fixed_submatrix,
+        "color_count_crop":     color_count_crop_mode is not None,
+        "color_count_crop_mode": color_count_crop_mode,
+        "color_bbox_crop":      color_bbox_crop_mode is not None,
+        "color_bbox_crop_mode": color_bbox_crop_mode,
+        "color_count_preserve_crop": color_count_preserve_crop_mode is not None,
+        "color_count_preserve_crop_mode": color_count_preserve_crop_mode,
+        "color_bbox_preserve_flip": color_bbox_preserve_flip_mode is not None,
+        "color_bbox_preserve_flip_mode": color_bbox_preserve_flip_mode,
         "spatial_color":        is_spatial_color,
         "spatial_color_transform": spatial_color_transform,
         "spatial_color_mapping": spatial_color_mapping,
