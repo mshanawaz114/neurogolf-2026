@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import numpy as np
 import onnx
 from onnx import TensorProto, helper
 
 from solvers.base import BaseSolver
-from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, save
+from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, _t, save
 
 
 def _self_kron_mask_net(h: int, w: int) -> onnx.ModelProto:
@@ -13,9 +14,17 @@ def _self_kron_mask_net(h: int, w: int) -> onnx.ModelProto:
     out_w = w * w
     nodes = []
     inits = []
+    tile_kernel = np.zeros((C, 1, out_h - h + 1, out_w - w + 1), dtype=np.float32)
+    for c in range(C):
+        for dy in range(h):
+            for dx in range(w):
+                tile_kernel[c, 0, dy * h, dx * w] = 1.0
+    block_kernel = np.ones((1, 1, h, w), dtype=np.float32)
 
-    # Crop the original input grid.
     inits += [
+        _t("skm_tile_w", tile_kernel),
+        _t("skm_block_w", block_kernel),
+        _make_float("skm_one", [1.0]),
         _make_int64("skm_rs", [0]),
         _make_int64("skm_re", [h]),
         _make_int64("skm_ra", [2]),
@@ -24,43 +33,44 @@ def _self_kron_mask_net(h: int, w: int) -> onnx.ModelProto:
         _make_int64("skm_ce", [w]),
         _make_int64("skm_ca", [3]),
         _make_int64("skm_cst", [1]),
+        _make_int64("skm_bg_s", [0]),
+        _make_int64("skm_bg_e", [1]),
+        _make_int64("skm_bg_a", [1]),
+        _make_int64("skm_bg_st", [1]),
     ]
+
     nodes.append(helper.make_node("Slice", inputs=["input", "skm_rs", "skm_re", "skm_ra", "skm_rst"], outputs=["skm_rows"]))
     nodes.append(helper.make_node("Slice", inputs=["skm_rows", "skm_cs", "skm_ce", "skm_ca", "skm_cst"], outputs=["skm_crop"]))
 
-    # Tile the cropped input h x w times.
-    row_tiles = []
-    for i in range(w):
-        row_tiles.append("skm_crop")
-    nodes.append(helper.make_node("Concat", inputs=row_tiles, outputs=["skm_row_tile"], axis=3))
-    col_tiles = []
-    for i in range(h):
-        col_tiles.append("skm_row_tile")
-    nodes.append(helper.make_node("Concat", inputs=col_tiles, outputs=["skm_tiled"], axis=2))
-
-    # Build the non-zero mask from channels 1..9 and resize it blockwise.
-    inits += [
-        _make_int64("skm_nzs", [1]),
-        _make_int64("skm_nze", [C]),
-        _make_int64("skm_nza", [1]),
-        _make_int64("skm_nzst", [1]),
-    ]
-    nodes.append(helper.make_node("Slice", inputs=["input", "skm_nzs", "skm_nze", "skm_nza", "skm_nzst"], outputs=["skm_nonbg"]))
-    nodes.append(helper.make_node("ReduceMax", inputs=["skm_nonbg"], outputs=["skm_mask_full"], axes=[1], keepdims=1))
-    nodes.append(helper.make_node("Slice", inputs=["skm_mask_full", "skm_rs", "skm_re", "skm_ra", "skm_rst"], outputs=["skm_mask_rows"]))
-    nodes.append(helper.make_node("Slice", inputs=["skm_mask_rows", "skm_cs", "skm_ce", "skm_ca", "skm_cst"], outputs=["skm_mask_crop"]))
-
-    inits.append(_make_float("skm_roi", []))
-    inits.append(_make_float("skm_scales", []))
-    inits.append(_make_int64("skm_sizes", [1, 1, out_h, out_w]))
+    # Tile the cropped input into a full 9x9 kron canvas.
     nodes.append(
         helper.make_node(
-            "Resize",
-            inputs=["skm_mask_crop", "skm_roi", "skm_scales", "skm_sizes"],
+            "ConvTranspose",
+            inputs=["skm_crop", "skm_tile_w"],
+            outputs=["skm_tiled"],
+            kernel_shape=[out_h - h + 1, out_w - w + 1],
+            pads=[0, 0, 0, 0],
+            group=C,
+        )
+    )
+
+    # Build the non-zero mask from the background channel only.
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["skm_crop", "skm_bg_s", "skm_bg_e", "skm_bg_a", "skm_bg_st"],
+            outputs=["skm_bg_crop"],
+        )
+    )
+    nodes.append(helper.make_node("Sub", inputs=["skm_one", "skm_bg_crop"], outputs=["skm_mask_crop"]))
+    nodes.append(
+        helper.make_node(
+            "ConvTranspose",
+            inputs=["skm_mask_crop", "skm_block_w"],
             outputs=["skm_mask_big"],
-            mode="nearest",
-            coordinate_transformation_mode="asymmetric",
-            nearest_mode="floor",
+            kernel_shape=[h, w],
+            pads=[0, 0, 0, 0],
+            strides=[h, w],
         )
     )
 
@@ -99,7 +109,7 @@ class SelfKronMaskSolver(BaseSolver):
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{task_id}.onnx"
         try:
-            save(_self_kron_mask_net(h, w), str(path))
+            save(_self_kron_mask_net(h, w), str(path), try_simplify=False)
             return path
         except Exception as e:
             print(f"    SelfKronMaskSolver failed: {e}")

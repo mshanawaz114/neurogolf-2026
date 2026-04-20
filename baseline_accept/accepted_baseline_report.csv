@@ -1,0 +1,24 @@
+task_id,nodes,bytes,op_types
+task001,9,1355,Concat Mul Pad ReduceMax Resize Slice
+task002,199,16370,Add Clip Concat Conv Mul Slice Sub
+task031,2025,181906,Add Conv Mul Pad ReduceMax Slice Sub
+task032,21,1740,Add Cast Concat CumSum Equal Mul ReduceMax ReduceSum Slice Sub Unsqueeze
+task053,2,428,Pad Slice
+task078,19,1653,Cast Concat CumSum Equal Mul ReduceMax ReduceSum Slice Sub Unsqueeze
+task081,43,4404,Add Clip Concat Conv Mul Pad Slice Sub
+task087,3,606,Pad Slice
+task135,2,429,Pad Slice
+task140,3,606,Pad Slice
+task150,100,9851,Add Mul Pad ReduceMax Slice Sub
+task155,72,7194,Add Mul Pad ReduceMax Slice Sub
+task179,3,505,Pad Slice Transpose
+task223,2,523,Resize Slice
+task241,88,8374,Add Mul Pad ReduceMax Slice Sub Transpose
+task248,161,341729,Add Mul ReduceMax Slice Sub
+task251,199,16370,Add Clip Concat Conv Mul Slice Sub
+task258,19,2628,Add Clip Concat Conv Mul Slice Sub
+task273,126,13108,Add Clip Concat Conv ConvTranspose Mul Pad Slice Sub
+task276,1,586,Conv
+task307,2,523,Resize Slice
+task309,1,586,Conv
+task326,2,429,Pad Slice

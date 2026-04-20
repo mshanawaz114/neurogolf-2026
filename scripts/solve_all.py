@@ -33,8 +33,12 @@ from solvers.spatial_color import SpatialColorSolver
 from solvers.color_perm import ColorPermSolver
 from solvers.tiling     import TilingSolver
 from solvers.translate  import TranslateSolver
+from solvers.translate_color import TranslateColorSolver
 from solvers.self_kron_mask import SelfKronMaskSolver
 from solvers.color_hole_fill import ColorHoleFillSolver
+from solvers.seed_halo import SeedHaloSolver
+from solvers.marker_block_fill import MarkerBlockFillSolver
+from solvers.directional_cross_seed import DirectionalCrossSeedSolver
 from solvers.corner_rect_fill import CornerRectFillSolver
 from solvers.horizontal_gap_fill import HorizontalGapFillSolver
 from solvers.lcorner_fill import LCornerFillSolver
@@ -56,8 +60,12 @@ ALL_SOLVERS = [
     ColorPermSolver(),
     TilingSolver(),
     TranslateSolver(),
+    TranslateColorSolver(),
     SelfKronMaskSolver(),
     ColorHoleFillSolver(),
+    SeedHaloSolver(),
+    MarkerBlockFillSolver(),
+    DirectionalCrossSeedSolver(),
     CornerRectFillSolver(),
     HorizontalGapFillSolver(),
     LCornerFillSolver(),
@@ -75,7 +83,8 @@ ALL_SOLVERS = [
 
 
 def solve_task(task_id: str, task: dict, onnx_dir: Path,
-               use_learned: bool = True) -> dict:
+               use_learned: bool = True,
+               validate_splits: list[str] | None = None) -> dict:
     analysis = analyse_task(task)
     solvers = [s for s in ALL_SOLVERS
                if use_learned or not isinstance(s, LearnedSolver)]
@@ -97,7 +106,7 @@ def solve_task(task_id: str, task: dict, onnx_dir: Path,
 
         # Validate against all available splits
         try:
-            ok = validate_onnx(str(path), task, splits=["train", "test", "arc-gen"])
+            ok = validate_onnx(str(path), task, splits=validate_splits or ["train", "test", "arc-gen"])
         except Exception as e:
             print(f"    → validation error: {e}")
             ok = False
@@ -138,6 +147,11 @@ def main():
                         help="Skip the slow LearnedSolver")
     parser.add_argument("--task",       default=None,
                         help="Solve a single task, e.g. --task task001")
+    parser.add_argument(
+        "--splits",
+        default="train,test,arc-gen",
+        help="Comma-separated splits to use for analysis/build/validation, e.g. train,test",
+    )
     args = parser.parse_args()
 
     tasks_dir = Path(args.tasks_dir)
@@ -152,6 +166,11 @@ def main():
         print(f"No task files found in {tasks_dir}")
         return
 
+    selected_splits = [s.strip() for s in args.splits.split(",") if s.strip()]
+    if not selected_splits:
+        print("No splits selected")
+        return
+
     results = []
     solved = 0
     total_score = 0.0
@@ -164,8 +183,12 @@ def main():
     for task_file in task_files:
         task_id = task_file.stem
         print(f"\n[{task_id}]")
-        task = load_task(task_file)
-        result = solve_task(task_id, task, onnx_dir, not args.no_learned)
+        full_task = load_task(task_file)
+        task = {k: v for k, v in full_task.items() if k not in {"train", "test", "arc-gen"}}
+        for split in selected_splits:
+            if split in full_task:
+                task[split] = full_task[split]
+        result = solve_task(task_id, task, onnx_dir, not args.no_learned, validate_splits=selected_splits)
         results.append(result)
         if result["solver"] is not None:
             solved += 1

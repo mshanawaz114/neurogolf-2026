@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import numpy as np
 import onnx
 from onnx import TensorProto, helper
 
 from solvers.base import BaseSolver
 from utils.arc_utils import detect_color_count_preserve_crop, grid_to_array
-from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, _t, save, static_crop_shift_nodes
+from utils.onnx_builder import CANVAS, CHANNELS as C, _make_float, _make_int64, _t, save
 
 
 def _color_count_preserve_crop_net(mode: str) -> onnx.ModelProto:
@@ -20,9 +21,6 @@ def _color_count_preserve_crop_net(mode: str) -> onnx.ModelProto:
 
     def reduce_max(inp: str, out: str, axes_vals: list[int], keepdims: int = 1):
         nodes.append(helper.make_node("ReduceMax", inputs=[inp], outputs=[out], axes=axes_vals, keepdims=keepdims))
-
-    def reduce_min(inp: str, out: str, axes_vals: list[int], keepdims: int = 1):
-        nodes.append(helper.make_node("ReduceMin", inputs=[inp], outputs=[out], axes=axes_vals, keepdims=keepdims))
 
     reduce_sum("input", "ccp_counts", [2, 3], keepdims=0)
     inits += [
@@ -39,71 +37,186 @@ def _color_count_preserve_crop_net(mode: str) -> onnx.ModelProto:
         )
     )
 
-    if mode == "max":
-        nodes.append(helper.make_node("ArgMax", inputs=["ccp_nonbg_counts"], outputs=["ccp_idx0"], axis=1, keepdims=0))
-    elif mode == "min":
-        inits.append(_make_float("ccp_zero_f", [0.0]))
-        inits.append(_make_float("ccp_big_f", [[1e9] * (C - 1)]))
-        nodes.append(helper.make_node("Greater", inputs=["ccp_nonbg_counts", "ccp_zero_f"], outputs=["ccp_present_b"]))
+    inits += [
+        _make_float("ccp_zero_f", [0.0]),
+        _make_float("ccp_one_f", [1.0]),
+        _make_int64("ccp_shape1911", [1, C - 1, 1, 1]),
+        _make_int64("ccp_shape1", [1]),
+    ]
+
+    def slice_count(idx: int, out: str) -> None:
+        inits.extend([
+            _make_int64(f"{out}_s", [idx]),
+            _make_int64(f"{out}_e", [idx + 1]),
+            _make_int64(f"{out}_a", [1]),
+            _make_int64(f"{out}_st", [1]),
+        ])
         nodes.append(
-            helper.make_node("Where", inputs=["ccp_present_b", "ccp_nonbg_counts", "ccp_big_f"], outputs=["ccp_masked_counts"])
+            helper.make_node(
+                "Slice",
+                inputs=["ccp_nonbg_counts", f"{out}_s", f"{out}_e", f"{out}_a", f"{out}_st"],
+                outputs=[out],
+            )
         )
-        nodes.append(helper.make_node("ArgMin", inputs=["ccp_masked_counts"], outputs=["ccp_idx0"], axis=1, keepdims=0))
-    else:
-        raise ValueError(f"unknown mode: {mode}")
 
-    inits.append(_make_int64("ccp_one_i", [1]))
-    nodes.append(helper.make_node("Add", inputs=["ccp_idx0", "ccp_one_i"], outputs=["ccp_color_idx"]))
-    nodes.append(helper.make_node("Gather", inputs=["input", "ccp_color_idx"], outputs=["ccp_sel"], axis=1))
+    indicators = []
+    for idx in range(C - 1):
+        cur = f"ccp_count_{idx}"
+        slice_count(idx, cur)
+        nodes.append(helper.make_node("Clip", inputs=[cur, "ccp_zero_f", "ccp_one_f"], outputs=[f"ccp_pos_{idx}"]))
+        active = f"ccp_pos_{idx}"
+        for jdx in range(C - 1):
+            if idx == jdx:
+                continue
+            other = f"ccp_count_{idx}_{jdx}"
+            slice_count(jdx, other)
+            if mode == "max":
+                nodes.append(helper.make_node("Sub", inputs=[cur, other], outputs=[f"ccp_diff_{idx}_{jdx}"]))
+                nodes.append(helper.make_node("Relu", inputs=[f"ccp_diff_{idx}_{jdx}"], outputs=[f"ccp_relu_{idx}_{jdx}"]))
+                nodes.append(
+                    helper.make_node("Clip", inputs=[f"ccp_relu_{idx}_{jdx}", "ccp_zero_f", "ccp_one_f"], outputs=[f"ccp_gt_{idx}_{jdx}"])
+                )
+                nodes.append(helper.make_node("Equal", inputs=[cur, other], outputs=[f"ccp_eqb_{idx}_{jdx}"]))
+                nodes.append(
+                    helper.make_node("Cast", inputs=[f"ccp_eqb_{idx}_{jdx}"], outputs=[f"ccp_eq_{idx}_{jdx}"], to=TensorProto.FLOAT)
+                )
+                nodes.append(helper.make_node("Add", inputs=[f"ccp_gt_{idx}_{jdx}", f"ccp_eq_{idx}_{jdx}"], outputs=[f"ccp_ge_raw_{idx}_{jdx}"]))
+                nodes.append(
+                    helper.make_node("Clip", inputs=[f"ccp_ge_raw_{idx}_{jdx}", "ccp_zero_f", "ccp_one_f"], outputs=[f"ccp_ge_{idx}_{jdx}"])
+                )
+                cmp_name = f"ccp_gt_{idx}_{jdx}" if jdx < idx else f"ccp_ge_{idx}_{jdx}"
+            else:
+                nodes.append(helper.make_node("Clip", inputs=[other, "ccp_zero_f", "ccp_one_f"], outputs=[f"ccp_pos_{idx}_{jdx}"]))
+                nodes.append(helper.make_node("Sub", inputs=["ccp_one_f", f"ccp_pos_{idx}_{jdx}"], outputs=[f"ccp_other_absent_{idx}_{jdx}"]))
+                nodes.append(helper.make_node("Sub", inputs=[other, cur], outputs=[f"ccp_diff_{idx}_{jdx}"]))
+                nodes.append(helper.make_node("Relu", inputs=[f"ccp_diff_{idx}_{jdx}"], outputs=[f"ccp_relu_{idx}_{jdx}"]))
+                nodes.append(
+                    helper.make_node("Clip", inputs=[f"ccp_relu_{idx}_{jdx}", "ccp_zero_f", "ccp_one_f"], outputs=[f"ccp_lt_{idx}_{jdx}"])
+                )
+                nodes.append(helper.make_node("Equal", inputs=[cur, other], outputs=[f"ccp_eqb_{idx}_{jdx}"]))
+                nodes.append(
+                    helper.make_node("Cast", inputs=[f"ccp_eqb_{idx}_{jdx}"], outputs=[f"ccp_eq_{idx}_{jdx}"], to=TensorProto.FLOAT)
+                )
+                nodes.append(helper.make_node("Add", inputs=[f"ccp_lt_{idx}_{jdx}", f"ccp_eq_{idx}_{jdx}"], outputs=[f"ccp_le_raw_{idx}_{jdx}"]))
+                nodes.append(
+                    helper.make_node("Clip", inputs=[f"ccp_le_raw_{idx}_{jdx}", "ccp_zero_f", "ccp_one_f"], outputs=[f"ccp_le_{idx}_{jdx}"])
+                )
+                base_cmp = f"ccp_lt_{idx}_{jdx}" if jdx < idx else f"ccp_le_{idx}_{jdx}"
+                nodes.append(
+                    helper.make_node("Add", inputs=[base_cmp, f"ccp_other_absent_{idx}_{jdx}"], outputs=[f"ccp_cmp_raw_{idx}_{jdx}"])
+                )
+                nodes.append(
+                    helper.make_node("Clip", inputs=[f"ccp_cmp_raw_{idx}_{jdx}", "ccp_zero_f", "ccp_one_f"], outputs=[f"ccp_cmp_{idx}_{jdx}"])
+                )
+                cmp_name = f"ccp_cmp_{idx}_{jdx}"
+            next_active = f"ccp_sel_{idx}_{jdx}"
+            nodes.append(helper.make_node("Mul", inputs=[active, cmp_name], outputs=[next_active]))
+            active = next_active
+        indicators.append(active)
 
-    reduce_max("ccp_sel", "ccp_sel_hw", [1], keepdims=0)
-    reduce_max("ccp_sel_hw", "ccp_row_presence", [2], keepdims=0)
-    reduce_max("ccp_sel_hw", "ccp_col_presence", [1], keepdims=0)
+    nodes.append(helper.make_node("Concat", inputs=indicators, outputs=["ccp_selector"], axis=1))
+    nodes.append(helper.make_node("Reshape", inputs=["ccp_selector", "ccp_shape1911"], outputs=["ccp_selector_4d"]))
+
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["input", "ccp_cstart", "ccp_cend", "ccp_caxis", "ccp_cstep"],
+            outputs=["ccp_nonbg_input"],
+        )
+    )
+    nodes.append(helper.make_node("Mul", inputs=["ccp_nonbg_input", "ccp_selector_4d"], outputs=["ccp_selected_all"]))
+    reduce_max("ccp_selected_all", "ccp_selected_mask", [1], keepdims=1)
+
+    reduce_max("ccp_selected_mask", "ccp_row_presence", [1, 3], keepdims=0)
+    reduce_max("ccp_selected_mask", "ccp_col_presence", [1, 2], keepdims=0)
 
     inits += [
-        _make_float("ccp_zero_mask", [[0.0] * CANVAS]),
-        _make_int64("ccp_ids", [list(range(CANVAS))]),
-        _make_int64("ccp_ids_p1", [list(range(1, CANVAS + 1))]),
-        _make_int64("ccp_big", [[CANVAS] * CANVAS]),
-        _make_int64("ccp_zeros", [[0] * CANVAS]),
+        _make_int64("ccp_row_axis", [1]),
+        _t("ccp_ids_f", np.arange(CANVAS, dtype=np.float32).reshape(1, CANVAS)),
+        _t("ccp_ids_p1_f", np.arange(1, CANVAS + 1, dtype=np.float32).reshape(1, CANVAS)),
+        _make_int64("ccp_rev_s", [2**31 - 1]),
+        _make_int64("ccp_rev_e", [-(2**31)]),
+        _make_int64("ccp_rev_a", [1]),
+        _make_int64("ccp_rev_st", [-1]),
     ]
-    nodes.append(helper.make_node("Greater", inputs=["ccp_row_presence", "ccp_zero_mask"], outputs=["ccp_row_present_b"]))
-    nodes.append(helper.make_node("Where", inputs=["ccp_row_present_b", "ccp_ids", "ccp_big"], outputs=["ccp_y0_candidates"]))
-    reduce_min("ccp_y0_candidates", "ccp_y0", [1], keepdims=0)
-    nodes.append(helper.make_node("Where", inputs=["ccp_row_present_b", "ccp_ids_p1", "ccp_zeros"], outputs=["ccp_y1_candidates"]))
-    reduce_max("ccp_y1_candidates", "ccp_y1", [1], keepdims=0)
 
-    nodes.append(helper.make_node("Greater", inputs=["ccp_col_presence", "ccp_zero_mask"], outputs=["ccp_col_present_b"]))
-    nodes.append(helper.make_node("Where", inputs=["ccp_col_present_b", "ccp_ids", "ccp_big"], outputs=["ccp_x0_candidates"]))
-    reduce_min("ccp_x0_candidates", "ccp_x0", [1], keepdims=0)
-    nodes.append(helper.make_node("Where", inputs=["ccp_col_present_b", "ccp_ids_p1", "ccp_zeros"], outputs=["ccp_x1_candidates"]))
-    reduce_max("ccp_x1_candidates", "ccp_x1", [1], keepdims=0)
+    nodes.append(helper.make_node("CumSum", inputs=["ccp_row_presence", "ccp_row_axis"], outputs=["ccp_row_csum"]))
+    nodes.append(helper.make_node("Equal", inputs=["ccp_row_csum", "ccp_one_f"], outputs=["ccp_row_first_b"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccp_row_first_b"], outputs=["ccp_row_first_eq"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Mul", inputs=["ccp_row_first_eq", "ccp_row_presence"], outputs=["ccp_row_first"]))
+    nodes.append(helper.make_node("Mul", inputs=["ccp_row_first", "ccp_ids_f"], outputs=["ccp_y0_weighted"]))
+    reduce_sum("ccp_y0_weighted", "ccp_y0_sum_f", [1], keepdims=0)
+    nodes.append(helper.make_node("Reshape", inputs=["ccp_y0_sum_f", "ccp_shape1"], outputs=["ccp_y0_scalar_f"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccp_y0_scalar_f"], outputs=["ccp_y0"], to=TensorProto.INT64))
 
-    # Static crop-and-shift via MatMul — input [1,C,30,30] → need single channel for crop
-    # For preserve_crop we crop ALL channels, not just selected color.
-    # Apply shift to each channel: sum over channels of per-channel shifts.
-    # Easier: reshape input to [C,30,30], apply P_rows @ x @ P_cols^T, reshape back.
-    # We reuse static_crop_shift_nodes per-channel by treating [1,C,30,30] as [C] channels.
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["ccp_row_presence", "ccp_rev_s", "ccp_rev_e", "ccp_rev_a", "ccp_rev_st"],
+            outputs=["ccp_row_rev"],
+        )
+    )
+    nodes.append(helper.make_node("CumSum", inputs=["ccp_row_rev", "ccp_row_axis"], outputs=["ccp_row_rev_csum"]))
+    nodes.append(helper.make_node("Equal", inputs=["ccp_row_rev_csum", "ccp_one_f"], outputs=["ccp_row_last_b"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccp_row_last_b"], outputs=["ccp_row_last_eq"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Mul", inputs=["ccp_row_last_eq", "ccp_row_rev"], outputs=["ccp_row_last_rev"]))
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["ccp_row_last_rev", "ccp_rev_s", "ccp_rev_e", "ccp_rev_a", "ccp_rev_st"],
+            outputs=["ccp_row_last"],
+        )
+    )
+    nodes.append(helper.make_node("Mul", inputs=["ccp_row_last", "ccp_ids_p1_f"], outputs=["ccp_y1_weighted"]))
+    reduce_sum("ccp_y1_weighted", "ccp_y1_sum_f", [1], keepdims=0)
+    nodes.append(helper.make_node("Reshape", inputs=["ccp_y1_sum_f", "ccp_shape1"], outputs=["ccp_y1_scalar_f"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccp_y1_scalar_f"], outputs=["ccp_y1"], to=TensorProto.INT64))
 
-    # Reshape [1,C,30,30] -> [C,30,30]
+    nodes.append(helper.make_node("CumSum", inputs=["ccp_col_presence", "ccp_row_axis"], outputs=["ccp_col_csum"]))
+    nodes.append(helper.make_node("Equal", inputs=["ccp_col_csum", "ccp_one_f"], outputs=["ccp_col_first_b"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccp_col_first_b"], outputs=["ccp_col_first_eq"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Mul", inputs=["ccp_col_first_eq", "ccp_col_presence"], outputs=["ccp_col_first"]))
+    nodes.append(helper.make_node("Mul", inputs=["ccp_col_first", "ccp_ids_f"], outputs=["ccp_x0_weighted"]))
+    reduce_sum("ccp_x0_weighted", "ccp_x0_sum_f", [1], keepdims=0)
+    nodes.append(helper.make_node("Reshape", inputs=["ccp_x0_sum_f", "ccp_shape1"], outputs=["ccp_x0_scalar_f"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccp_x0_scalar_f"], outputs=["ccp_x0"], to=TensorProto.INT64))
+
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["ccp_col_presence", "ccp_rev_s", "ccp_rev_e", "ccp_rev_a", "ccp_rev_st"],
+            outputs=["ccp_col_rev"],
+        )
+    )
+    nodes.append(helper.make_node("CumSum", inputs=["ccp_col_rev", "ccp_row_axis"], outputs=["ccp_col_rev_csum"]))
+    nodes.append(helper.make_node("Equal", inputs=["ccp_col_rev_csum", "ccp_one_f"], outputs=["ccp_col_last_b"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccp_col_last_b"], outputs=["ccp_col_last_eq"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Mul", inputs=["ccp_col_last_eq", "ccp_col_rev"], outputs=["ccp_col_last_rev"]))
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["ccp_col_last_rev", "ccp_rev_s", "ccp_rev_e", "ccp_rev_a", "ccp_rev_st"],
+            outputs=["ccp_col_last"],
+        )
+    )
+    nodes.append(helper.make_node("Mul", inputs=["ccp_col_last", "ccp_ids_p1_f"], outputs=["ccp_x1_weighted"]))
+    reduce_sum("ccp_x1_weighted", "ccp_x1_sum_f", [1], keepdims=0)
+    nodes.append(helper.make_node("Reshape", inputs=["ccp_x1_sum_f", "ccp_shape1"], outputs=["ccp_x1_scalar_f"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccp_x1_scalar_f"], outputs=["ccp_x1"], to=TensorProto.INT64))
+
+    # Static crop-and-shift via MatMul on the full input tensor.
     inits.append(_make_int64("ccp_shapeC2", [C, CANVAS, CANVAS]))
     nodes.append(helper.make_node("Reshape", inputs=["input", "ccp_shapeC2"], outputs=["ccp_inp_2d"]))
-
-    # Build P_rows and P_cols inline using Relu arithmetic (avoids Equal/Less/And/Cast-from-bool)
-    # P_rows[r,j] = Relu(1 - |jmr_f - y0_f|) * Relu(1 - Relu(j+1 - y1_f))
-    # P_cols[c,k] = Relu(1 - |jmr_f - x0_f|) * Relu(1 - Relu(k+1 - x1_f))
-    import numpy as np
     r_vec = np.arange(CANVAS, dtype=np.float32).reshape(CANVAS, 1)
     j_vec = np.arange(CANVAS, dtype=np.float32).reshape(1, CANVAS)
-    j_minus_r_f = j_vec - r_vec          # [30,30] float
-    j_p1_f = np.arange(1, CANVAS + 1, dtype=np.float32).reshape(1, CANVAS)  # [1,30]
+    j_minus_r_f = j_vec - r_vec
+    j_p1_f = np.arange(1, CANVAS + 1, dtype=np.float32).reshape(1, CANVAS)
 
     inits.append(_t("ccp_jmr_f", j_minus_r_f))
     inits.append(_t("ccp_jp1_f", j_p1_f))
     inits.append(_t("ccp_ones_f", np.ones((1, 1), dtype=np.float32)))
 
     inits.append(_make_int64("ccp_shape11", [1, 1]))
-    # Cast y0/y1/x0/x1 (int64 [1]) → float → [1,1]
     for tag in ["y0", "y1", "x0", "x1"]:
         nodes.append(helper.make_node("Cast",
             inputs=[f"ccp_{tag}"], outputs=[f"ccp_{tag}_fflat"], to=TensorProto.FLOAT))
@@ -135,12 +248,8 @@ def _color_count_preserve_crop_net(mode: str) -> onnx.ModelProto:
     nodes.append(helper.make_node("Mul", inputs=["ccp_Pc_ind", "ccp_lt_x1"], outputs=["ccp_Pc"]))
     nodes.append(helper.make_node("Transpose", inputs=["ccp_Pc"], outputs=["ccp_Pc_T"], perm=[1, 0]))
 
-    # Apply: P_rows @ inp_2d [C,30,30] -> [C,30,30]
     nodes.append(helper.make_node("MatMul", inputs=["ccp_Pr", "ccp_inp_2d"], outputs=["ccp_rows_sh"]))
-    # Then: rows_sh [C,30,30] @ P_cols^T [30,30] -> [C,30,30]
     nodes.append(helper.make_node("MatMul", inputs=["ccp_rows_sh", "ccp_Pc_T"], outputs=["ccp_shifted"]))
-
-    # Reshape back [C,30,30] -> [1,C,30,30]
     inits.append(_make_int64("ccp_shape_out", [1, C, CANVAS, CANVAS]))
     nodes.append(helper.make_node("Reshape", inputs=["ccp_shifted", "ccp_shape_out"], outputs=["output"]))
 

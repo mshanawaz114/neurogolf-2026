@@ -1,43 +1,37 @@
 from __future__ import annotations
 
 from pathlib import Path
+import numpy as np
 import onnx
 from onnx import TensorProto, helper
 
 from solvers.base import BaseSolver
 from utils.arc_utils import detect_fixed_submatrix, grid_to_array
-from utils.onnx_builder import CANVAS, CHANNELS as C, _make_int64, save
+from utils.onnx_builder import CANVAS, CHANNELS as C, _make_int64, _t, save
 
 
 def _fixed_crop_net(y0: int, y1: int, x0: int, x1: int) -> onnx.ModelProto:
     out_h = y1 - y0
     out_w = x1 - x0
-    nodes = []
-    inits = [
-        _make_int64("fc_rs", [y0]),
-        _make_int64("fc_re", [y1]),
-        _make_int64("fc_ra", [2]),
-        _make_int64("fc_rst", [1]),
-        _make_int64("fc_cs", [x0]),
-        _make_int64("fc_ce", [x1]),
-        _make_int64("fc_ca", [3]),
-        _make_int64("fc_cst", [1]),
-        _make_int64("fc_pad", [0, 0, 0, 0, 0, 0, CANVAS - out_h, CANVAS - out_w]),
-    ]
+    row_proj = np.zeros((CANVAS, CANVAS), dtype=np.float32)
+    col_proj = np.zeros((CANVAS, CANVAS), dtype=np.float32)
+    for out_y in range(out_h):
+        row_proj[out_y, y0 + out_y] = 1.0
+    for out_x in range(out_w):
+        col_proj[x0 + out_x, out_x] = 1.0
 
-    nodes.append(
-        helper.make_node(
-            "Slice", inputs=["input", "fc_rs", "fc_re", "fc_ra", "fc_rst"], outputs=["fc_rows"]
-        )
-    )
-    nodes.append(
-        helper.make_node(
-            "Slice", inputs=["fc_rows", "fc_cs", "fc_ce", "fc_ca", "fc_cst"], outputs=["fc_crop"]
-        )
-    )
-    nodes.append(
-        helper.make_node("Pad", inputs=["fc_crop", "fc_pad"], outputs=["output"], mode="constant")
-    )
+    nodes = [
+        helper.make_node("Reshape", inputs=["input", "fc_shape_cnn"], outputs=["fc_in2d"]),
+        helper.make_node("MatMul", inputs=["fc_row_proj", "fc_in2d"], outputs=["fc_rows"]),
+        helper.make_node("MatMul", inputs=["fc_rows", "fc_col_proj"], outputs=["fc_shifted"]),
+        helper.make_node("Reshape", inputs=["fc_shifted", "fc_shape_1cnn"], outputs=["output"]),
+    ]
+    inits = [
+        _t("fc_row_proj", row_proj),
+        _t("fc_col_proj", col_proj),
+        _make_int64("fc_shape_cnn", [C, CANVAS, CANVAS]),
+        _make_int64("fc_shape_1cnn", [1, C, CANVAS, CANVAS]),
+    ]
 
     graph = helper.make_graph(
         nodes,

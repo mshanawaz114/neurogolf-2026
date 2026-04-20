@@ -75,6 +75,11 @@ static23-zip:
 	$(PYTHON) scripts/build_safe_submission.py --profile static23
 	@echo "Done: submission_full_safe.zip"
 
+static25-zip:
+	@echo "Building submission_full_safe.zip with the static25 profile..."
+	$(PYTHON) scripts/build_safe_submission.py --profile static25
+	@echo "Done: submission_full_safe.zip"
+
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
 	find . -type f -name "*.pyc" -delete

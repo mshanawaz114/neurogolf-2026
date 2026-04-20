@@ -49,9 +49,23 @@ STATIC23_OPS = CONSERVATIVE_SAFE_OPS + (
     "Unsqueeze",
 )
 
+STATIC25_OPS = STATIC23_OPS + (
+    "Abs",
+    "MatMul",
+    "Relu",
+    "Reshape",
+)
+
+SPATIAL_REPAIR_OPS = CONSERVATIVE_SAFE_OPS + (
+    "MatMul",
+    "Reshape",
+)
+
 SAFE_PROFILES = {
     "conservative": set(CONSERVATIVE_SAFE_OPS),
+    "spatial_repair": set(SPATIAL_REPAIR_OPS),
     "static23": set(STATIC23_OPS),
+    "static25": set(STATIC25_OPS),
 }
 
 
@@ -59,6 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks-dir", default="tasks/")
     parser.add_argument("--source-onnx-dir", default="onnx/")
+    parser.add_argument(
+        "--overlay-onnx-dir",
+        default=None,
+        help="Optional secondary ONNX directory. Use its models only for --overlay-task ids.",
+    )
     parser.add_argument("--safe-onnx-dir", default="onnx_safe_full/")
     parser.add_argument("--results-csv", default="results.csv")
     parser.add_argument("--report-csv", default="safe_submission_report.csv")
@@ -86,6 +105,18 @@ def parse_args() -> argparse.Namespace:
         action="append",
         dest="force_fallback_tasks",
         help="Force a task to use the identity fallback even if its ops are otherwise allowed.",
+    )
+    parser.add_argument(
+        "--only-keep-task",
+        action="append",
+        dest="only_keep_tasks",
+        help="If provided, keep exact models only for these task ids and fall back on every other task.",
+    )
+    parser.add_argument(
+        "--overlay-task",
+        action="append",
+        dest="overlay_tasks",
+        help="When --overlay-onnx-dir is set, take these task ids from the overlay directory instead of the primary source.",
     )
     return parser.parse_args()
 
@@ -116,6 +147,7 @@ def reset_dir(out_dir: Path) -> None:
 def build_bundle(
     tasks_dir: Path,
     source_onnx_dir: Path,
+    overlay_onnx_dir: Path | None,
     safe_onnx_dir: Path,
     results_csv: Path,
     report_csv: Path,
@@ -123,6 +155,8 @@ def build_bundle(
     safe_ops: set[str],
     force_keep_tasks: set[str],
     force_fallback_tasks: set[str],
+    only_keep_tasks: set[str] | None,
+    overlay_tasks: set[str],
 ) -> None:
     results = load_results(results_csv)
     task_ids = sorted(task_path.stem for task_path in tasks_dir.glob("task*.json"))
@@ -135,9 +169,26 @@ def build_bundle(
     kept_score = 0.0
 
     for task_id in task_ids:
-        src = source_onnx_dir / f"{task_id}.onnx"
+        src_dir = overlay_onnx_dir if overlay_onnx_dir is not None and task_id in overlay_tasks else source_onnx_dir
+        src = src_dir / f"{task_id}.onnx"
         dst = safe_onnx_dir / f"{task_id}.onnx"
         result = results.get(task_id, {})
+
+        if only_keep_tasks is not None and task_id not in only_keep_tasks:
+            write_identity_model(dst)
+            fallback += 1
+            kept_rows.append(
+                {
+                    "task_id": task_id,
+                    "mode": "identity_fallback",
+                    "solver": result.get("solver", ""),
+                    "local_score": result.get("score", ""),
+                    "source_model": str(src) if src.exists() else "",
+                    "op_types": "",
+                    "reason": "not_in_only_keep_set",
+                }
+            )
+            continue
 
         if task_id in force_fallback_tasks:
             write_identity_model(dst)
@@ -172,7 +223,11 @@ def build_bundle(
                         "local_score": result.get("score", ""),
                         "source_model": str(src),
                         "op_types": " ".join(ops),
-                        "reason": "forced_keep" if task_id in force_keep_tasks else "op_set_safe",
+                        "reason": (
+                            "forced_keep"
+                            if task_id in force_keep_tasks
+                            else ("overlay_op_set_safe" if src_dir == overlay_onnx_dir else "op_set_safe")
+                        ),
                     }
                 )
                 continue
@@ -243,9 +298,12 @@ def main() -> None:
         safe_ops.update(args.safe_ops)
     force_keep_tasks = set(args.force_keep_tasks or [])
     force_fallback_tasks = set(args.force_fallback_tasks or [])
+    only_keep_tasks = set(args.only_keep_tasks) if args.only_keep_tasks else None
+    overlay_tasks = set(args.overlay_tasks or [])
     build_bundle(
         tasks_dir=Path(args.tasks_dir),
         source_onnx_dir=Path(args.source_onnx_dir),
+        overlay_onnx_dir=Path(args.overlay_onnx_dir) if args.overlay_onnx_dir else None,
         safe_onnx_dir=Path(args.safe_onnx_dir),
         results_csv=Path(args.results_csv),
         report_csv=Path(args.report_csv),
@@ -253,6 +311,8 @@ def main() -> None:
         safe_ops=safe_ops,
         force_keep_tasks=force_keep_tasks,
         force_fallback_tasks=force_fallback_tasks,
+        only_keep_tasks=only_keep_tasks,
+        overlay_tasks=overlay_tasks,
     )
 
 

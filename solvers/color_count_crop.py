@@ -22,9 +22,6 @@ def _color_count_crop_net(mode: str) -> onnx.ModelProto:
     def reduce_max(inp: str, out: str, axes_vals: list[int], keepdims: int = 1):
         nodes.append(helper.make_node("ReduceMax", inputs=[inp], outputs=[out], axes=axes_vals, keepdims=keepdims))
 
-    def reduce_min(inp: str, out: str, axes_vals: list[int], keepdims: int = 1):
-        nodes.append(helper.make_node("ReduceMin", inputs=[inp], outputs=[out], axes=axes_vals, keepdims=keepdims))
-
     reduce_sum("input", "ccc_counts", [2, 3], keepdims=0)
     inits += [
         _make_int64("ccc_cstart", [1]),
@@ -40,86 +37,213 @@ def _color_count_crop_net(mode: str) -> onnx.ModelProto:
         )
     )
 
-    if mode == "max":
-        nodes.append(helper.make_node("ArgMax", inputs=["ccc_nonbg_counts"], outputs=["ccc_idx0"], axis=1, keepdims=0))
-    else:
-        inits.append(_make_float("ccc_zero_f", [0.0]))
-        inits.append(_make_float("ccc_big_f", np.full((1, C - 1), 1e9, dtype=np.float32)))
-        nodes.append(helper.make_node("Greater", inputs=["ccc_nonbg_counts", "ccc_zero_f"], outputs=["ccc_present_b"]))
+    inits += [
+        _make_float("ccc_zero_f", [0.0]),
+        _make_float("ccc_one_f", [1.0]),
+        _make_int64("ccc_shape1911", [1, C - 1, 1, 1]),
+        _make_int64("ccc_shape1", [1]),
+        _t("ccc_ones_canvas", np.ones((1, 1, CANVAS, CANVAS), dtype=np.float32)),
+    ]
+
+    def slice_count(idx: int, out: str) -> None:
+        inits.extend([
+            _make_int64(f"{out}_s", [idx]),
+            _make_int64(f"{out}_e", [idx + 1]),
+            _make_int64(f"{out}_a", [1]),
+            _make_int64(f"{out}_st", [1]),
+        ])
         nodes.append(
             helper.make_node(
-                "Where", inputs=["ccc_present_b", "ccc_nonbg_counts", "ccc_big_f"], outputs=["ccc_masked_counts"]
+                "Slice",
+                inputs=["ccc_nonbg_counts", f"{out}_s", f"{out}_e", f"{out}_a", f"{out}_st"],
+                outputs=[out],
             )
         )
-        nodes.append(
-            helper.make_node("ArgMin", inputs=["ccc_masked_counts"], outputs=["ccc_idx0"], axis=1, keepdims=0)
+
+    def build_selector(sel_prefix: str, sel_mode: str) -> str:
+        indicators = []
+        for idx in range(C - 1):
+            cur = f"{sel_prefix}_count_{idx}"
+            slice_count(idx, cur)
+            nodes.append(helper.make_node("Clip", inputs=[cur, "ccc_zero_f", "ccc_one_f"], outputs=[f"{sel_prefix}_pos_{idx}"]))
+            active = f"{sel_prefix}_pos_{idx}"
+            for jdx in range(C - 1):
+                if idx == jdx:
+                    continue
+                other = f"{sel_prefix}_count_{idx}_{jdx}"
+                slice_count(jdx, other)
+                if sel_mode == "max":
+                    nodes.append(helper.make_node("Sub", inputs=[cur, other], outputs=[f"{sel_prefix}_diff_{idx}_{jdx}"]))
+                    nodes.append(helper.make_node("Relu", inputs=[f"{sel_prefix}_diff_{idx}_{jdx}"], outputs=[f"{sel_prefix}_relu_{idx}_{jdx}"]))
+                    nodes.append(
+                        helper.make_node("Clip", inputs=[f"{sel_prefix}_relu_{idx}_{jdx}", "ccc_zero_f", "ccc_one_f"], outputs=[f"{sel_prefix}_gt_{idx}_{jdx}"])
+                    )
+                    nodes.append(helper.make_node("Equal", inputs=[cur, other], outputs=[f"{sel_prefix}_eqb_{idx}_{jdx}"]))
+                    nodes.append(
+                        helper.make_node("Cast", inputs=[f"{sel_prefix}_eqb_{idx}_{jdx}"], outputs=[f"{sel_prefix}_eq_{idx}_{jdx}"], to=TensorProto.FLOAT)
+                    )
+                    nodes.append(helper.make_node("Add", inputs=[f"{sel_prefix}_gt_{idx}_{jdx}", f"{sel_prefix}_eq_{idx}_{jdx}"], outputs=[f"{sel_prefix}_ge_raw_{idx}_{jdx}"]))
+                    nodes.append(
+                        helper.make_node("Clip", inputs=[f"{sel_prefix}_ge_raw_{idx}_{jdx}", "ccc_zero_f", "ccc_one_f"], outputs=[f"{sel_prefix}_ge_{idx}_{jdx}"])
+                    )
+                    cmp_name = f"{sel_prefix}_gt_{idx}_{jdx}" if jdx < idx else f"{sel_prefix}_ge_{idx}_{jdx}"
+                else:
+                    nodes.append(helper.make_node("Clip", inputs=[other, "ccc_zero_f", "ccc_one_f"], outputs=[f"{sel_prefix}_pos_{idx}_{jdx}"]))
+                    nodes.append(helper.make_node("Sub", inputs=["ccc_one_f", f"{sel_prefix}_pos_{idx}_{jdx}"], outputs=[f"{sel_prefix}_other_absent_{idx}_{jdx}"]))
+                    nodes.append(helper.make_node("Sub", inputs=[other, cur], outputs=[f"{sel_prefix}_diff_{idx}_{jdx}"]))
+                    nodes.append(helper.make_node("Relu", inputs=[f"{sel_prefix}_diff_{idx}_{jdx}"], outputs=[f"{sel_prefix}_relu_{idx}_{jdx}"]))
+                    nodes.append(
+                        helper.make_node("Clip", inputs=[f"{sel_prefix}_relu_{idx}_{jdx}", "ccc_zero_f", "ccc_one_f"], outputs=[f"{sel_prefix}_lt_{idx}_{jdx}"])
+                    )
+                    nodes.append(helper.make_node("Equal", inputs=[cur, other], outputs=[f"{sel_prefix}_eqb_{idx}_{jdx}"]))
+                    nodes.append(
+                        helper.make_node("Cast", inputs=[f"{sel_prefix}_eqb_{idx}_{jdx}"], outputs=[f"{sel_prefix}_eq_{idx}_{jdx}"], to=TensorProto.FLOAT)
+                    )
+                    nodes.append(helper.make_node("Add", inputs=[f"{sel_prefix}_lt_{idx}_{jdx}", f"{sel_prefix}_eq_{idx}_{jdx}"], outputs=[f"{sel_prefix}_le_raw_{idx}_{jdx}"]))
+                    nodes.append(
+                        helper.make_node("Clip", inputs=[f"{sel_prefix}_le_raw_{idx}_{jdx}", "ccc_zero_f", "ccc_one_f"], outputs=[f"{sel_prefix}_le_{idx}_{jdx}"])
+                    )
+                    base_cmp = f"{sel_prefix}_lt_{idx}_{jdx}" if jdx < idx else f"{sel_prefix}_le_{idx}_{jdx}"
+                    nodes.append(
+                        helper.make_node("Add", inputs=[base_cmp, f"{sel_prefix}_other_absent_{idx}_{jdx}"], outputs=[f"{sel_prefix}_cmp_raw_{idx}_{jdx}"])
+                    )
+                    nodes.append(
+                        helper.make_node("Clip", inputs=[f"{sel_prefix}_cmp_raw_{idx}_{jdx}", "ccc_zero_f", "ccc_one_f"], outputs=[f"{sel_prefix}_cmp_{idx}_{jdx}"])
+                    )
+                    cmp_name = f"{sel_prefix}_cmp_{idx}_{jdx}"
+                next_active = f"{sel_prefix}_sel_{idx}_{jdx}"
+                nodes.append(helper.make_node("Mul", inputs=[active, cmp_name], outputs=[next_active]))
+                active = next_active
+            indicators.append(active)
+        selector_name = f"{sel_prefix}_selector"
+        nodes.append(helper.make_node("Concat", inputs=indicators, outputs=[selector_name], axis=1))
+        return selector_name
+
+    if mode == "unique_extreme":
+        max_selector = build_selector("ccc_max", "max")
+        min_selector = build_selector("ccc_min", "min")
+        nodes.append(helper.make_node("ReduceMax", inputs=["ccc_nonbg_counts"], outputs=["ccc_max_count"], axes=[1], keepdims=1))
+        nodes.append(helper.make_node("Equal", inputs=["ccc_nonbg_counts", "ccc_max_count"], outputs=["ccc_is_max_b"]))
+        nodes.append(helper.make_node("Cast", inputs=["ccc_is_max_b"], outputs=["ccc_is_max"], to=TensorProto.FLOAT))
+        reduce_sum("ccc_is_max", "ccc_num_max", [1], keepdims=1)
+        nodes.append(helper.make_node("Equal", inputs=["ccc_num_max", "ccc_one_f"], outputs=["ccc_unique_max_b"]))
+        nodes.append(helper.make_node("Cast", inputs=["ccc_unique_max_b"], outputs=["ccc_unique_max"], to=TensorProto.FLOAT))
+        nodes.append(helper.make_node("Sub", inputs=["ccc_one_f", "ccc_unique_max"], outputs=["ccc_not_unique_max"]))
+        nodes.append(helper.make_node("Mul", inputs=[max_selector, "ccc_unique_max"], outputs=["ccc_max_choice"]))
+        nodes.append(helper.make_node("Mul", inputs=[min_selector, "ccc_not_unique_max"], outputs=["ccc_min_choice"]))
+        nodes.append(helper.make_node("Add", inputs=["ccc_max_choice", "ccc_min_choice"], outputs=["ccc_selector"]))
+    else:
+        selector = build_selector("ccc", mode)
+        if selector != "ccc_selector":
+            nodes.append(helper.make_node("Identity", inputs=[selector], outputs=["ccc_selector"]))
+    nodes.append(helper.make_node("Reshape", inputs=["ccc_selector", "ccc_shape1911"], outputs=["ccc_selector_4d"]))
+
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["input", "ccc_cstart", "ccc_cend", "ccc_caxis", "ccc_cstep"],
+            outputs=["ccc_nonbg_input"],
         )
+    )
+    nodes.append(helper.make_node("Mul", inputs=["ccc_nonbg_input", "ccc_selector_4d"], outputs=["ccc_selected_all"]))
+    reduce_max("ccc_selected_all", "ccc_selected_mask", [1], keepdims=1)
 
-    inits.append(_make_int64("ccc_one_i", [1]))
-    nodes.append(helper.make_node("Add", inputs=["ccc_idx0", "ccc_one_i"], outputs=["ccc_color_idx"]))
-    nodes.append(helper.make_node("Gather", inputs=["input", "ccc_color_idx"], outputs=["ccc_sel"], axis=1))
-
-    reduce_max("ccc_sel", "ccc_sel_hw", [1], keepdims=0)
-    reduce_max("ccc_sel_hw", "ccc_row_presence", [2], keepdims=0)
-    reduce_max("ccc_sel_hw", "ccc_col_presence", [1], keepdims=0)
+    reduce_max("ccc_selected_mask", "ccc_row_presence", [1, 3], keepdims=0)
+    reduce_max("ccc_selected_mask", "ccc_col_presence", [1, 2], keepdims=0)
 
     inits += [
-        _make_float("ccc_zero_mask", np.zeros((1, CANVAS), dtype=np.float32)),
-        _t("ccc_row_ids", np.arange(CANVAS, dtype=np.int64).reshape(1, CANVAS)),
-        _t("ccc_row_ids_p1", np.arange(1, CANVAS + 1, dtype=np.int64).reshape(1, CANVAS)),
-        _make_int64("ccc_row_zeros", np.zeros((1, CANVAS), dtype=np.int64)),
-        _make_int64("ccc_row_big", np.full((1, CANVAS), CANVAS, dtype=np.int64)),
+        _make_int64("ccc_row_axis", [1]),
+        _t("ccc_ids_f", np.arange(CANVAS, dtype=np.float32).reshape(1, CANVAS)),
+        _t("ccc_ids_p1_f", np.arange(1, CANVAS + 1, dtype=np.float32).reshape(1, CANVAS)),
+        _make_int64("ccc_rev_s", [2**31 - 1]),
+        _make_int64("ccc_rev_e", [-(2**31)]),
+        _make_int64("ccc_rev_a", [1]),
+        _make_int64("ccc_rev_st", [-1]),
     ]
-    nodes.append(helper.make_node("Greater", inputs=["ccc_row_presence", "ccc_zero_mask"], outputs=["ccc_row_present_b"]))
-    nodes.append(
-        helper.make_node(
-            "Where", inputs=["ccc_row_present_b", "ccc_row_ids", "ccc_row_big"], outputs=["ccc_row_first_candidates"]
-        )
-    )
-    reduce_min("ccc_row_first_candidates", "ccc_y0", [1], keepdims=0)
-    nodes.append(
-        helper.make_node(
-            "Where", inputs=["ccc_row_present_b", "ccc_row_ids_p1", "ccc_row_zeros"], outputs=["ccc_row_last_candidates"]
-        )
-    )
-    reduce_max("ccc_row_last_candidates", "ccc_y1", [1], keepdims=0)
 
-    nodes.append(helper.make_node("Greater", inputs=["ccc_col_presence", "ccc_zero_mask"], outputs=["ccc_col_present_b"]))
-    nodes.append(
-        helper.make_node(
-            "Where", inputs=["ccc_col_present_b", "ccc_row_ids", "ccc_row_big"], outputs=["ccc_col_first_candidates"]
-        )
-    )
-    reduce_min("ccc_col_first_candidates", "ccc_x0", [1], keepdims=0)
-    nodes.append(
-        helper.make_node(
-            "Where", inputs=["ccc_col_present_b", "ccc_row_ids_p1", "ccc_row_zeros"], outputs=["ccc_col_last_candidates"]
-        )
-    )
-    reduce_max("ccc_col_last_candidates", "ccc_x1", [1], keepdims=0)
+    nodes.append(helper.make_node("CumSum", inputs=["ccc_row_presence", "ccc_row_axis"], outputs=["ccc_row_csum"]))
+    nodes.append(helper.make_node("Equal", inputs=["ccc_row_csum", "ccc_one_f"], outputs=["ccc_row_first_b"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccc_row_first_b"], outputs=["ccc_row_first_eq"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Mul", inputs=["ccc_row_first_eq", "ccc_row_presence"], outputs=["ccc_row_first"]))
+    nodes.append(helper.make_node("Mul", inputs=["ccc_row_first", "ccc_ids_f"], outputs=["ccc_y0_weighted"]))
+    reduce_sum("ccc_y0_weighted", "ccc_y0_sum_f", [1], keepdims=0)
+    nodes.append(helper.make_node("Reshape", inputs=["ccc_y0_sum_f", "ccc_shape1"], outputs=["ccc_y0_scalar_f"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccc_y0_scalar_f"], outputs=["ccc_y0"], to=TensorProto.INT64))
 
-    # Static crop-and-shift via MatMul (all shapes stay [30,30])
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["ccc_row_presence", "ccc_rev_s", "ccc_rev_e", "ccc_rev_a", "ccc_rev_st"],
+            outputs=["ccc_row_rev"],
+        )
+    )
+    nodes.append(helper.make_node("CumSum", inputs=["ccc_row_rev", "ccc_row_axis"], outputs=["ccc_row_rev_csum"]))
+    nodes.append(helper.make_node("Equal", inputs=["ccc_row_rev_csum", "ccc_one_f"], outputs=["ccc_row_last_b"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccc_row_last_b"], outputs=["ccc_row_last_eq"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Mul", inputs=["ccc_row_last_eq", "ccc_row_rev"], outputs=["ccc_row_last_rev"]))
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["ccc_row_last_rev", "ccc_rev_s", "ccc_rev_e", "ccc_rev_a", "ccc_rev_st"],
+            outputs=["ccc_row_last"],
+        )
+    )
+    nodes.append(helper.make_node("Mul", inputs=["ccc_row_last", "ccc_ids_p1_f"], outputs=["ccc_y1_weighted"]))
+    reduce_sum("ccc_y1_weighted", "ccc_y1_sum_f", [1], keepdims=0)
+    nodes.append(helper.make_node("Reshape", inputs=["ccc_y1_sum_f", "ccc_shape1"], outputs=["ccc_y1_scalar_f"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccc_y1_scalar_f"], outputs=["ccc_y1"], to=TensorProto.INT64))
+
+    nodes.append(helper.make_node("CumSum", inputs=["ccc_col_presence", "ccc_row_axis"], outputs=["ccc_col_csum"]))
+    nodes.append(helper.make_node("Equal", inputs=["ccc_col_csum", "ccc_one_f"], outputs=["ccc_col_first_b"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccc_col_first_b"], outputs=["ccc_col_first_eq"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Mul", inputs=["ccc_col_first_eq", "ccc_col_presence"], outputs=["ccc_col_first"]))
+    nodes.append(helper.make_node("Mul", inputs=["ccc_col_first", "ccc_ids_f"], outputs=["ccc_x0_weighted"]))
+    reduce_sum("ccc_x0_weighted", "ccc_x0_sum_f", [1], keepdims=0)
+    nodes.append(helper.make_node("Reshape", inputs=["ccc_x0_sum_f", "ccc_shape1"], outputs=["ccc_x0_scalar_f"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccc_x0_scalar_f"], outputs=["ccc_x0"], to=TensorProto.INT64))
+
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["ccc_col_presence", "ccc_rev_s", "ccc_rev_e", "ccc_rev_a", "ccc_rev_st"],
+            outputs=["ccc_col_rev"],
+        )
+    )
+    nodes.append(helper.make_node("CumSum", inputs=["ccc_col_rev", "ccc_row_axis"], outputs=["ccc_col_rev_csum"]))
+    nodes.append(helper.make_node("Equal", inputs=["ccc_col_rev_csum", "ccc_one_f"], outputs=["ccc_col_last_b"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccc_col_last_b"], outputs=["ccc_col_last_eq"], to=TensorProto.FLOAT))
+    nodes.append(helper.make_node("Mul", inputs=["ccc_col_last_eq", "ccc_col_rev"], outputs=["ccc_col_last_rev"]))
+    nodes.append(
+        helper.make_node(
+            "Slice",
+            inputs=["ccc_col_last_rev", "ccc_rev_s", "ccc_rev_e", "ccc_rev_a", "ccc_rev_st"],
+            outputs=["ccc_col_last"],
+        )
+    )
+    nodes.append(helper.make_node("Mul", inputs=["ccc_col_last", "ccc_ids_p1_f"], outputs=["ccc_x1_weighted"]))
+    reduce_sum("ccc_x1_weighted", "ccc_x1_sum_f", [1], keepdims=0)
+    nodes.append(helper.make_node("Reshape", inputs=["ccc_x1_sum_f", "ccc_shape1"], outputs=["ccc_x1_scalar_f"]))
+    nodes.append(helper.make_node("Cast", inputs=["ccc_x1_scalar_f"], outputs=["ccc_x1"], to=TensorProto.INT64))
+
     sn, si = static_crop_shift_nodes(
-        "ccc_sel", "ccc_mask_padded",
+        "ccc_selected_mask", "ccc_mask_padded",
         "ccc_y0", "ccc_y1", "ccc_x0", "ccc_x1",
         prefix="ccc_sc",
     )
     nodes += sn
     inits += si
 
-    # One-hot color mask using Relu arithmetic (avoids Equal + Cast-from-bool)
-    inits += [
-        _make_float("ccc_color_ids_f", list(range(C))),   # [0.0, 1.0, ..., 9.0]
-        _make_float("ccc_color_ones_f", [1.0]),             # scalar 1.0
-        _make_int64("ccc_color_shape", [1, C, 1, 1]),
-    ]
-    nodes.append(helper.make_node("Cast", inputs=["ccc_color_idx"], outputs=["ccc_color_idx_f"], to=TensorProto.FLOAT))
-    nodes.append(helper.make_node("Sub", inputs=["ccc_color_ids_f", "ccc_color_idx_f"], outputs=["ccc_color_diff"]))
-    nodes.append(helper.make_node("Abs", inputs=["ccc_color_diff"], outputs=["ccc_color_abs"]))
-    nodes.append(helper.make_node("Sub", inputs=["ccc_color_ones_f", "ccc_color_abs"], outputs=["ccc_color_hot_raw"]))
-    nodes.append(helper.make_node("Relu", inputs=["ccc_color_hot_raw"], outputs=["ccc_color_f"]))
-    nodes.append(helper.make_node("Reshape", inputs=["ccc_color_f", "ccc_color_shape"], outputs=["ccc_color_mask"]))
-    nodes.append(helper.make_node("Mul", inputs=["ccc_color_mask", "ccc_mask_padded"], outputs=["output"]))
+    sn, si = static_crop_shift_nodes(
+        "ccc_ones_canvas", "ccc_support_padded",
+        "ccc_y0", "ccc_y1", "ccc_x0", "ccc_x1",
+        prefix="ccc_sup",
+    )
+    nodes += sn
+    inits += si
+
+    nodes.append(helper.make_node("Sub", inputs=["ccc_support_padded", "ccc_mask_padded"], outputs=["ccc_bg"]))
+    nodes.append(helper.make_node("Mul", inputs=["ccc_selector_4d", "ccc_mask_padded"], outputs=["ccc_nonbg_out"]))
+    nodes.append(helper.make_node("Concat", inputs=["ccc_bg", "ccc_nonbg_out"], outputs=["output"], axis=1))
 
     graph = helper.make_graph(
         nodes,
@@ -138,11 +262,11 @@ class ColorCountCropSolver(BaseSolver):
     PRIORITY = 14
 
     def can_solve(self, analysis: dict) -> bool:
-        return bool(analysis.get("color_count_crop")) and analysis.get("color_count_crop_mode") in {"min", "max"}
+        return bool(analysis.get("color_count_crop")) and analysis.get("color_count_crop_mode") in {"min", "max", "unique_extreme"}
 
     def build(self, task_id: str, task: dict, analysis: dict, out_dir: Path) -> Path | None:
         mode = analysis.get("color_count_crop_mode")
-        if mode not in {"min", "max"}:
+        if mode not in {"min", "max", "unique_extreme"}:
             return None
 
         for split in ["train", "test", "arc-gen"]:

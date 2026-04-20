@@ -84,6 +84,12 @@ python3 scripts/build_safe_submission.py --profile static23
 
 # or
 make static23-zip
+
+# build the stronger selector-aware candidate that also keeps task300 + task310
+python3 scripts/build_safe_submission.py --profile static25
+
+# or
+make static25-zip
 ```
 
 That script:
@@ -99,6 +105,10 @@ Current conservative allowlist:
 Current `static23` allowlist:
 the conservative set plus
 `Cast`, `CumSum`, `Equal`, `ReduceSum`, `Unsqueeze`
+
+Current `static25` allowlist:
+the `static23` set plus
+`Abs`, `MatMul`, `Relu`, `Reshape`
 
 The builder also supports exact task-level ablations, which is useful when
 multiple risky solver families share the same operator set:

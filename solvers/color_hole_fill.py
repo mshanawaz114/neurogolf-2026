@@ -27,7 +27,7 @@ def _slice_channel(nodes: list, inits: list, idx: int, prefix: str) -> str:
     return out
 
 
-def _color_hole_fill_net(boundary: int, fill: int, steps: int = 60) -> onnx.ModelProto:
+def _color_hole_fill_net(boundary: int, fill: int, steps: int = 26) -> onnx.ModelProto:
     nodes = []
     inits = []
 

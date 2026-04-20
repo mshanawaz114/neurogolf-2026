@@ -214,6 +214,116 @@ def detect_translation(inp: np.ndarray, out: np.ndarray) -> tuple[int, int] | No
     return None
 
 
+def detect_translation_color(inp: np.ndarray, out: np.ndarray) -> tuple[tuple[int, int], dict[int, int]] | None:
+    """Detect zero-filled translation combined with a consistent per-pixel color remap."""
+    if inp.shape != out.shape:
+        return None
+    H, W = inp.shape
+    for dy in range(-H + 1, H):
+        for dx in range(-W + 1, W):
+            y0 = max(0, dy)
+            y1 = min(H, H + dy)
+            x0 = max(0, dx)
+            x1 = min(W, W + dx)
+            sy0 = max(0, -dy)
+            sy1 = sy0 + (y1 - y0)
+            sx0 = max(0, -dx)
+            sx1 = sx0 + (x1 - x0)
+
+            src = inp[sy0:sy1, sx0:sx1]
+            dst = out[y0:y1, x0:x1]
+            mapping: dict[int, int] = {}
+            ok = True
+            for s, d in zip(src.flat, dst.flat):
+                s = int(s)
+                d = int(d)
+                if s in mapping:
+                    if mapping[s] != d:
+                        ok = False
+                        break
+                else:
+                    mapping[s] = d
+            if not ok:
+                continue
+
+            pred = np.zeros_like(inp)
+            for s, d in mapping.items():
+                pred[y0:y1, x0:x1][src == s] = d
+            if np.array_equal(pred, out):
+                return (dy, dx), mapping
+    return None
+
+
+def detect_marker_block_fill(inp: np.ndarray, out: np.ndarray) -> bool:
+    """
+    Detect partitioned block fill:
+    - separator rows/cols are entirely color 5 and remain unchanged
+    - each non-separator region contains exactly one non-zero, non-5 marker
+    - output fills that whole region with marker+5
+    """
+    if inp.shape != out.shape:
+        return False
+    H, W = inp.shape
+    sep_rows = [r for r in range(H) if np.all(inp[r, :] == 5)]
+    sep_cols = [c for c in range(W) if np.all(inp[:, c] == 5)]
+
+    if not sep_cols:
+        return False
+    if any(not np.array_equal(inp[r, :], out[r, :]) for r in sep_rows):
+        return False
+    if any(not np.array_equal(inp[:, c], out[:, c]) for c in sep_cols):
+        return False
+
+    row_edges = [-1] + sep_rows + [H]
+    col_edges = [-1] + sep_cols + [W]
+    seen_region = False
+    for r0, r1 in zip(row_edges[:-1], row_edges[1:]):
+        for c0, c1 in zip(col_edges[:-1], col_edges[1:]):
+            ys = slice(r0 + 1, r1)
+            xs = slice(c0 + 1, c1)
+            if ys.start >= ys.stop or xs.start >= xs.stop:
+                continue
+            in_reg = inp[ys, xs]
+            out_reg = out[ys, xs]
+            vals = [int(v) for v in np.unique(in_reg) if int(v) not in (0, 5)]
+            if len(vals) != 1:
+                return False
+            marker = vals[0]
+            if np.count_nonzero(in_reg == marker) != 1:
+                return False
+            if not np.array_equal(out_reg, np.full_like(out_reg, marker + 5)):
+                return False
+            seen_region = True
+    return seen_region
+
+
+def detect_directional_cross_seed(inp: np.ndarray, out: np.ndarray) -> bool:
+    """
+    Detect per-seed directional cross stamping:
+    each input 1 produces center=1, up=2, left=7, right=6, down=8.
+    Overlaps are consistent because all seeds share the same template.
+    """
+    if inp.shape != out.shape:
+        return False
+    vals = [int(v) for v in np.unique(inp) if int(v) != 0]
+    if vals != [1]:
+        return False
+    H, W = inp.shape
+    pred = np.zeros_like(inp)
+    ys, xs = np.where(inp == 1)
+    for y, x in zip(ys, xs):
+        pred[y, x] = 1
+        if y - 1 >= 0:
+            pred[y - 1, x] = 2
+        if x - 1 >= 0:
+            pred[y, x - 1] = 7
+        if x + 1 < W:
+            pred[y, x + 1] = 6
+        if y + 1 < H:
+            pred[y + 1, x] = 8
+    return np.array_equal(pred, out)
+
+
 def detect_upscale(inp: np.ndarray, out: np.ndarray, max_scale: int = 5) -> tuple[int, int] | None:
     """Detect integer nearest-neighbour upscaling."""
     for sy in range(2, max_scale + 1):
@@ -251,6 +361,29 @@ def detect_fixed_submatrix(inp: np.ndarray, out: np.ndarray) -> tuple[int, int, 
     return None
 
 
+def _select_color_by_count_mode(inp: np.ndarray, mode: str) -> int | None:
+    vals, cnts = np.unique(inp[inp != 0], return_counts=True)
+    if len(vals) == 0:
+        return None
+
+    counts = [(int(v), int(c)) for v, c in zip(vals.tolist(), cnts.tolist())]
+    if mode == "max":
+        return max(counts, key=lambda kv: (kv[1], -kv[0]))[0]
+    if mode == "min":
+        return min(counts, key=lambda kv: (kv[1], kv[0]))[0]
+    if mode == "unique_extreme":
+        max_count = max(c for _, c in counts)
+        min_count = min(c for _, c in counts)
+        max_colors = [v for v, c in counts if c == max_count]
+        min_colors = [v for v, c in counts if c == min_count]
+        if len(max_colors) == 1:
+            return max_colors[0]
+        if len(min_colors) == 1:
+            return min_colors[0]
+        return None
+    raise ValueError(f"unknown color-count mode: {mode}")
+
+
 def detect_color_count_crop(inp: np.ndarray, out: np.ndarray, mode: str) -> bool:
     """
     Detect crop-to-bbox of a selected non-zero colour, preserving only that colour.
@@ -258,17 +391,9 @@ def detect_color_count_crop(inp: np.ndarray, out: np.ndarray, mode: str) -> bool
       - "max": select the most frequent non-zero colour
       - "min": select the least frequent non-zero colour
     """
-    vals, cnts = np.unique(inp[inp != 0], return_counts=True)
-    if len(vals) == 0:
+    color = _select_color_by_count_mode(inp, mode)
+    if color is None:
         return False
-
-    counts = [(int(v), int(c)) for v, c in zip(vals.tolist(), cnts.tolist())]
-    if mode == "max":
-        color = max(counts, key=lambda kv: (kv[1], -kv[0]))[0]
-    elif mode == "min":
-        color = min(counts, key=lambda kv: (kv[1], kv[0]))[0]
-    else:
-        raise ValueError(f"unknown color-count mode: {mode}")
 
     ys, xs = np.where(inp == color)
     if len(ys) == 0:
@@ -326,17 +451,9 @@ def detect_color_count_preserve_crop(inp: np.ndarray, out: np.ndarray, mode: str
       - "min": select the least frequent non-zero colour
       - "max": select the most frequent non-zero colour
     """
-    vals, cnts = np.unique(inp[inp != 0], return_counts=True)
-    if len(vals) == 0:
+    color = _select_color_by_count_mode(inp, mode)
+    if color is None:
         return False
-
-    counts = [(int(v), int(c)) for v, c in zip(vals.tolist(), cnts.tolist())]
-    if mode == "min":
-        color = min(counts, key=lambda kv: (kv[1], kv[0]))[0]
-    elif mode == "max":
-        color = max(counts, key=lambda kv: (kv[1], -kv[0]))[0]
-    else:
-        raise ValueError(f"unknown color-count preserve mode: {mode}")
 
     ys, xs = np.where(inp == color)
     if len(ys) == 0:
@@ -728,6 +845,18 @@ def analyse_task(task: dict) -> dict[str, Any]:
         is_translation = all(t == ref for t in translations[1:])
         translation = ref if is_translation else None
 
+    # --- Translation + color remap (from train only) ---
+    translation_colors = [detect_translation_color(i, o) for i, o in detect_pairs]
+    is_translation_color = all(t is not None for t in translation_colors)
+    translation_color_delta = None
+    translation_color_mapping = None
+    if is_translation_color:
+        ref_delta, ref_mapping = translation_colors[0]
+        is_translation_color = all(t[0] == ref_delta and t[1] == ref_mapping for t in translation_colors[1:])
+        if is_translation_color:
+            translation_color_delta = ref_delta
+            translation_color_mapping = ref_mapping
+
     # --- Integer upscaling (from train only) ---
     upscales = [detect_upscale(i, o) for i, o in detect_pairs]
     is_upscale = all(s is not None for s in upscales)
@@ -773,8 +902,11 @@ def analyse_task(task: dict) -> dict[str, Any]:
     # --- Crop bbox of selected colour by count rule (from train only) ---
     min_count_color_crop = all(detect_color_count_crop(i, o, "min") for i, o in detect_pairs)
     max_count_color_crop = all(detect_color_count_crop(i, o, "max") for i, o in detect_pairs)
+    unique_extreme_color_crop = all(detect_color_count_crop(i, o, "unique_extreme") for i, o in detect_pairs)
     color_count_crop_mode = None
-    if min_count_color_crop ^ max_count_color_crop:
+    if unique_extreme_color_crop:
+        color_count_crop_mode = "unique_extreme"
+    elif min_count_color_crop ^ max_count_color_crop:
         color_count_crop_mode = "min" if min_count_color_crop else "max"
 
     # --- Crop bbox of selected colour by bbox-area rule (from train only) ---
@@ -787,8 +919,11 @@ def analyse_task(task: dict) -> dict[str, Any]:
     # --- Crop bbox of selected colour by count rule, preserving full subgrid ---
     min_count_preserve_crop = all(detect_color_count_preserve_crop(i, o, "min") for i, o in detect_pairs)
     max_count_preserve_crop = all(detect_color_count_preserve_crop(i, o, "max") for i, o in detect_pairs)
+    unique_extreme_preserve_crop = all(detect_color_count_preserve_crop(i, o, "unique_extreme") for i, o in detect_pairs)
     color_count_preserve_crop_mode = None
-    if min_count_preserve_crop ^ max_count_preserve_crop:
+    if unique_extreme_preserve_crop:
+        color_count_preserve_crop_mode = "unique_extreme"
+    elif min_count_preserve_crop ^ max_count_preserve_crop:
         color_count_preserve_crop_mode = "min" if min_count_preserve_crop else "max"
 
     # --- Crop bbox of selected colour by bbox rule, preserve subgrid, then flip_h ---
@@ -868,6 +1003,12 @@ def analyse_task(task: dict) -> dict[str, Any]:
             bounce_height = ref_h
             bounce_widths = tuple(sorted({bs[2] for bs in bounce_seeds}))
 
+    # --- Partitioned marker-to-block fill ---
+    is_marker_block_fill = all(detect_marker_block_fill(i, o) for i, o in detect_pairs)
+
+    # --- Directional colored cross around seed 1s ---
+    is_directional_cross_seed = all(detect_directional_cross_seed(i, o) for i, o in detect_pairs)
+
     # --- Size info (train pairs only, for building fixed-size networks) ---
     train_in_shapes  = list({i.shape for i, o in detect_pairs})
     train_out_shapes = list({o.shape for i, o in detect_pairs})
@@ -882,6 +1023,9 @@ def analyse_task(task: dict) -> dict[str, Any]:
         "gravity_up":           is_gravity_up,
         "translation":          is_translation,
         "translation_delta":    translation,
+        "translation_color":    is_translation_color,
+        "translation_color_delta": translation_color_delta,
+        "translation_color_mapping": translation_color_mapping,
         "upscale":              is_upscale,
         "upscale_factor":       upscale_factor,
         "trim_bbox":            is_trim_bbox,
@@ -915,6 +1059,8 @@ def analyse_task(task: dict) -> dict[str, Any]:
         "bounce_seed_color":    bounce_seed_color,
         "bounce_height":        bounce_height,
         "bounce_widths":        bounce_widths,
+        "marker_block_fill":    is_marker_block_fill,
+        "directional_cross_seed": is_directional_cross_seed,
         "spatial_color":        is_spatial_color,
         "spatial_color_transform": spatial_color_transform,
         "spatial_color_mapping": spatial_color_mapping,
